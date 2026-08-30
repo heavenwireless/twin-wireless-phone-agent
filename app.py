@@ -1,4 +1,5 @@
 import os
+import re
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client as TwilioClient
@@ -34,21 +35,80 @@ FINANCING_LINKS = {
     ),
 }
 
-SYSTEM_PROMPT = """You are the phone assistant for Twin Wireless, a device repair shop
-at 2328 Line Ave, Shreveport, LA 71104, phone (318) 670-3938, website twin-wireless.com.
+# Female voices only, one per supported language. Add a new language by adding
+# an entry here (Twilio Gather STT locale + a Polly voice + a display name +
+# a couple of keywords that trigger switching into it) -- no other code needs
+# to change, and no prompt needs to be translated by hand, since Claude
+# translates the single English system prompt on the fly per the
+# MULTI-LANGUAGE instruction below.
+LANGUAGES = {
+    "en": {
+        "name": "English",
+        "gather_language": "en-US",
+        "voice": "Polly.Joanna",
+        "switch_keywords": ["english", "inglés", "ingles"],
+    },
+    "es": {
+        "name": "Spanish",
+        "gather_language": "es-MX",
+        "voice": "Polly.Penelope",
+        "switch_keywords": [
+            "español",
+            "espanol",
+            "spanish",
+            "hola",
+            "gracias",
+            "por favor",
+            "cómo",
+            "como estas",
+            "dónde",
+            "cuándo",
+            "ayuda",
+            "reparar",
+            "pantalla",
+            "teléfono",
+            "telefono",
+        ],
+    },
+}
+DEFAULT_LANGUAGE = "en"
+
+AGENT_NAME = "Mia"
+
+SYSTEM_PROMPT = f"""You are {AGENT_NAME}, the phone assistant for Twin Wireless, a device
+repair shop at 2328 Line Ave, Shreveport, LA 71104, phone (318) 670-3938, website
+twin-wireless.com.
 Hours: Monday-Saturday 9AM-8PM, Sunday 11AM-5PM.
 
 You are answering a live phone call. Your replies are spoken aloud by text-to-speech, so
 keep them short, natural, and conversational -- a sentence or two per turn, never a long
 paragraph. This is the start of the call if the user message is exactly "[CALL STARTED]" --
-in that case, greet the caller and ask what they need, using the correct greeting for
-whether the shop is currently open or closed (you will be told the current status below).
+in that case, greet the caller by introducing yourself as {AGENT_NAME} from Twin Wireless and
+ask what they need, using the correct greeting for whether the shop is currently open or
+closed (you will be told the current status below). On this first greeting only, add one
+short, natural line letting Spanish speakers know they can continue in Spanish (e.g. "-- y
+también hablo español, si prefieres.").
 
-TONE: Talking like the tech at the counter, not a call center. Casual, quick, confident --
-contractions, plain language ("your screen," "the charging port"), no corporate script-speak
-("I understand your concern," "at this time," "representative," "please hold"). Never use a
-personal name when talking about who handles things -- say "our team," "one of our techs,"
-or "someone from the shop," never an individual's name.
+TONE: Warm and friendly, like a helpful person at the counter who's genuinely glad to hear
+from you -- not a call center, but not stiff either. Talk like a real person: contractions,
+plain language ("your screen," "the charging port"), a little personality and warmth in how
+you phrase things. It's fine to be upbeat ("Happy to help with that!") or empathetic ("Oof,
+cracked screens are the worst, let's get that sorted") where it fits naturally -- but stay
+quick and efficient, never ramble or pad. No corporate script-speak ("I understand your
+concern," "at this time," "representative," "please hold"). Never use a personal name when
+talking about who handles things -- say "our team," "one of our techs," or "someone from the
+shop," never an individual staff member's name (this rule is about staff, not about your own
+name as {AGENT_NAME}).
+
+MULTI-LANGUAGE: Twin Wireless serves both English- and Spanish-speaking customers today, and
+may add more languages later. Every caller message below is prefixed with a tag like
+"[LANGUAGE: English]" or "[LANGUAGE: Spanish]" telling you which language the caller is
+currently using -- always reply ONLY in that language, translating the tone, facts, and rules
+in this prompt naturally into it. Never mix two languages in one reply, and never mention the
+tag itself. If a caller explicitly asks to switch languages ("can we do this in English?",
+"en español, por favor"), switch immediately on your very next reply. Exception: when calling
+the take_message tool, always write caller_name and summary in plain English regardless of
+the conversation's language, since the shop team reads these messages in English.
 
 NON-NEGOTIABLE RULES:
 - Never claim Apple certification, authorization, or "genuine Apple parts." If asked about
@@ -103,8 +163,17 @@ housing swap rather than just the glass) follows the free-diagnosis/callback rul
 OTHER SERVICES (not repairs -- you can talk about these too, they're not out of scope):
 - Prepaid wireless activation: Simple Mobile, AT&T Prepaid, Cricket Wireless, Verizon
   Prepaid. $25 assisted activation fee, due only after we verify the request. In-store setup
-  takes about 15 minutes; online setup about 30 minutes. Works with eSIM or physical SIM
-  depending on the device.
+  takes about 15 minutes and requires the phone to be with you (we check the IMEI and set the
+  line up on the handset); online setup takes about 30 minutes once we have the details, and
+  needs the device IMEI first.
+- eSIM: YES, Twin Wireless absolutely supports eSIM -- if a caller asks "do you do eSIM" or
+  "can I get an eSIM," the answer is yes, never "no we don't sell it." We check the phone's
+  IMEI to confirm eSIM compatibility, then set the line up on either eSIM or a physical SIM,
+  whichever the phone supports -- most newer iPhones and many newer Android phones support
+  eSIM. If they're not sure what their phone supports, mention the free IMEI check on the
+  website answers it in seconds.
+- Unlocking & device setup: carrier-unlock eligibility checks, SIM and eSIM setup, email and
+  account setup, and basic software updates on a device brought in to the shop.
 - Xfinity Prepaid home internet: Twin Wireless is an authorized Xfinity dealer for prepaid
   home internet service. There's no set price list -- it depends on the customer's address
   and what Xfinity is currently offering there, so we have to check their address first.
@@ -142,14 +211,32 @@ your spoken reply first, then call the tool.
 sessions = {}
 
 
+def detect_language(text, current_language):
+    lowered = text.lower()
+    for code, cfg in LANGUAGES.items():
+        if code == current_language:
+            continue
+        for keyword in cfg["switch_keywords"]:
+            if re.search(r"\b" + re.escape(keyword) + r"\b", lowered):
+                return code
+    return current_language
+
+
 def call_claude(call_sid, user_text, is_open, next_open_text):
-    history = sessions.setdefault(call_sid, [])
+    session = sessions.setdefault(call_sid, {"history": [], "language": DEFAULT_LANGUAGE})
+    history = session["history"]
+    language_name = LANGUAGES[session["language"]]["name"]
     status_note = (
         f"[Current status: shop is OPEN right now.]"
         if is_open
         else f"[Current status: shop is CLOSED right now. Next open: {next_open_text}.]"
     )
-    history.append({"role": "user", "content": f"{status_note}\n{user_text}"})
+    history.append(
+        {
+            "role": "user",
+            "content": f"[LANGUAGE: {language_name}]\n{status_note}\n{user_text}",
+        }
+    )
 
     response = claude.messages.create(
         model=MODEL,
@@ -309,25 +396,31 @@ def send_review_link_sms(caller_number):
         print(f"send_review_link_sms failed: {exc}")
 
 
-@app.route("/voice", methods=["POST"])
-def voice():
-    call_sid = request.form.get("CallSid")
-    sessions[call_sid] = []
-
-    is_open, next_open = shop_open_status()
-    spoken, _ = call_claude(call_sid, "[CALL STARTED]", is_open, next_open)
-
-    vr = VoiceResponse()
-    gather = Gather(
+def build_gather(language):
+    return Gather(
         input="speech",
         action="/gather",
         method="POST",
         speech_timeout="auto",
         timeout=6,
+        language=LANGUAGES[language]["gather_language"],
     )
-    gather.say(spoken, voice="Polly.Matthew")
+
+
+@app.route("/voice", methods=["POST"])
+def voice():
+    call_sid = request.form.get("CallSid")
+    sessions[call_sid] = {"history": [], "language": DEFAULT_LANGUAGE}
+
+    is_open, next_open = shop_open_status()
+    spoken, _ = call_claude(call_sid, "[CALL STARTED]", is_open, next_open)
+
+    language = sessions[call_sid]["language"]
+    vr = VoiceResponse()
+    gather = build_gather(language)
+    gather.say(spoken, voice=LANGUAGES[language]["voice"])
     vr.append(gather)
-    vr.say("Sorry, I didn't catch that. Please call back and try again.")
+    vr.say("Sorry, I didn't catch that. Please call back and try again.", voice=LANGUAGES[DEFAULT_LANGUAGE]["voice"])
     vr.hangup()
     return Response(str(vr), mimetype="text/xml")
 
@@ -336,27 +429,26 @@ def voice():
 def gather():
     call_sid = request.form.get("CallSid")
     speech = request.form.get("SpeechResult", "")
+    session = sessions.setdefault(call_sid, {"history": [], "language": DEFAULT_LANGUAGE})
     vr = VoiceResponse()
 
     if not speech:
-        gather = Gather(
-            input="speech",
-            action="/gather",
-            method="POST",
-            speech_timeout="auto",
-            timeout=6,
-        )
-        gather.say("Sorry, I didn't catch that -- could you say that again?", voice="Polly.Matthew")
+        language = session["language"]
+        gather = build_gather(language)
+        gather.say("Sorry, I didn't catch that -- could you say that again?", voice=LANGUAGES[language]["voice"])
         vr.append(gather)
-        vr.say("Sorry, I'm having trouble hearing you. Please call back. Goodbye.")
+        vr.say("Sorry, I'm having trouble hearing you. Please call back. Goodbye.", voice=LANGUAGES[language]["voice"])
         vr.hangup()
         return Response(str(vr), mimetype="text/xml")
 
+    session["language"] = detect_language(speech, session["language"])
+
     is_open, next_open = shop_open_status()
     spoken, tool_call = call_claude(call_sid, speech, is_open, next_open)
+    language = session["language"]
 
     if spoken:
-        vr.say(spoken, voice="Polly.Matthew")
+        vr.say(spoken, voice=LANGUAGES[language]["voice"])
 
     if tool_call and tool_call.name == "take_message":
         send_message_sms(tool_call.input)
@@ -375,15 +467,9 @@ def gather():
     if tool_call and tool_call.name == "send_review_link":
         send_review_link_sms(request.form.get("From"))
 
-    gather = Gather(
-        input="speech",
-        action="/gather",
-        method="POST",
-        speech_timeout="auto",
-        timeout=6,
-    )
+    gather = build_gather(language)
     vr.append(gather)
-    vr.say("Thanks for calling Twin Wireless. Goodbye.")
+    vr.say("Thanks for calling Twin Wireless. Goodbye.", voice=LANGUAGES[language]["voice"])
     vr.hangup()
     return Response(str(vr), mimetype="text/xml")
 
