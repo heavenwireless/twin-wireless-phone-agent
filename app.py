@@ -1,0 +1,253 @@
+import os
+from flask import Flask, request, Response
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client as TwilioClient
+import anthropic
+
+app = Flask(__name__)
+
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
+OWNER_PHONE = os.environ["OWNER_PHONE"]
+
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+MODEL = "claude-haiku-4-5-20251001"
+
+SYSTEM_PROMPT = """You are the phone assistant for Twin Wireless, a device repair shop
+at 2328 Line Ave, Shreveport, LA 71104, phone (318) 670-3938, website twin-wireless.com.
+Owner: Murad. Hours: Monday-Saturday 9AM-8PM, Sunday 11AM-5PM.
+
+You are answering a live phone call. Your replies are spoken aloud by text-to-speech, so
+keep them short, natural, and conversational -- a sentence or two per turn, never a long
+paragraph. This is the start of the call if the user message is exactly "[CALL STARTED]" --
+in that case, greet the caller and ask what they need, using the correct greeting for
+whether the shop is currently open or closed (you will be told the current status below).
+
+TONE: Talking like the tech at the counter, not a call center. Casual, quick, confident --
+contractions, plain language ("your screen," "the charging port"), no corporate script-speak
+("I understand your concern," "at this time," "representative," "please hold").
+
+NON-NEGOTIABLE RULES:
+- Never claim Apple certification, authorization, or "genuine Apple parts." If asked about
+  Apple affiliation, say Twin Wireless is an independent repair shop, not affiliated with or
+  authorized by Apple.
+- Never promise a specific turnaround time. If asked, say many repairs are done same day
+  depending on the model and part availability, and offer a callback to confirm timing.
+- Never invent a price. The ONLY prices you may state are: iPhone screen repair starting at
+  $29.99 (confirmed after inspection), and iPhone back glass starting at $100 for most models.
+  Every other repair is "call for price" / "we'd need to take a look" -- this is deliberate,
+  not a gap, so don't apologize for it or offer to guess.
+- Never take payment info, card numbers, or ID/SSN numbers over the phone.
+- Repairs offered: phones, tablets/iPads, computers/laptops, and game consoles ONLY. Twin
+  Wireless does NOT repair TVs or anything outside that list -- if asked, say so plainly and
+  ask if there's something in that lineup you can help with instead. Don't take a message for
+  out-of-scope devices.
+- Walk-in diagnosis is free.
+- If you don't know something (e.g. status of a specific repair ticket), say so honestly and
+  offer to take a message for a callback -- never guess or make something up.
+
+WHEN TO TAKE A MESSAGE (use the take_message tool): a price isn't one of the two published
+prices, a repair status check, the caller wants to speak to a person, the caller seems upset,
+or anything else you can't confidently resolve yourself. Get their name and callback number
+first by asking in conversation, then call the tool once you have both.
+
+WHEN TO END THE CALL (use the end_call tool): once the caller's question is fully answered
+and there's nothing else they need, or right after taking a message. Say a brief goodbye in
+your spoken reply first, then call the tool.
+"""
+
+sessions = {}
+
+
+def call_claude(call_sid, user_text, is_open, next_open_text):
+    history = sessions.setdefault(call_sid, [])
+    status_note = (
+        f"[Current status: shop is OPEN right now.]"
+        if is_open
+        else f"[Current status: shop is CLOSED right now. Next open: {next_open_text}.]"
+    )
+    history.append({"role": "user", "content": f"{status_note}\n{user_text}"})
+
+    response = claude.messages.create(
+        model=MODEL,
+        max_tokens=300,
+        system=SYSTEM_PROMPT,
+        tools=[
+            {
+                "name": "take_message",
+                "description": (
+                    "Record a callback message for Murad because the question needs a "
+                    "human, a price isn't one of the two published prices, or the caller "
+                    "wants to speak to someone."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "caller_name": {"type": "string"},
+                        "callback_number": {"type": "string"},
+                        "category": {
+                            "type": "string",
+                            "enum": [
+                                "pricing",
+                                "status_check",
+                                "general",
+                                "urgent",
+                            ],
+                        },
+                        "summary": {"type": "string"},
+                    },
+                    "required": [
+                        "caller_name",
+                        "callback_number",
+                        "category",
+                        "summary",
+                    ],
+                },
+            },
+            {
+                "name": "end_call",
+                "description": (
+                    "End the call after saying goodbye -- use once the caller's question "
+                    "is fully answered, or right after taking a message."
+                ),
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ],
+        messages=history,
+    )
+
+    spoken_parts = []
+    tool_call = None
+    for block in response.content:
+        if block.type == "text":
+            spoken_parts.append(block.text)
+        elif block.type == "tool_use":
+            tool_call = block
+
+    spoken = " ".join(spoken_parts).strip()
+    history.append({"role": "assistant", "content": response.content})
+
+    if tool_call:
+        tool_result = {"type": "tool_result", "tool_use_id": tool_call.id, "content": "ok"}
+        history.append({"role": "user", "content": [tool_result]})
+
+    return spoken, tool_call
+
+
+def shop_open_status():
+    # Mon-Sat 9AM-8PM, Sun 11AM-5PM, America/Chicago. Render's default TZ is UTC,
+    # so this converts using a fixed offset -- good enough for CST/CDT most of the
+    # year; revisit if DST edge cases matter.
+    import datetime
+
+    now_utc = datetime.datetime.utcnow()
+    now_central = now_utc - datetime.timedelta(hours=5)  # approx CDT offset
+    weekday = now_central.weekday()  # Mon=0 .. Sun=6
+    hour = now_central.hour + now_central.minute / 60
+
+    if weekday == 6:  # Sunday
+        is_open = 11 <= hour < 17
+        next_open = "today at 11 AM" if hour < 11 else "tomorrow at 9 AM"
+    else:
+        is_open = 9 <= hour < 20
+        if hour < 9:
+            next_open = "today at 9 AM"
+        elif weekday == 5:  # Saturday closing into Sunday
+            next_open = "tomorrow at 11 AM"
+        else:
+            next_open = "tomorrow at 9 AM"
+
+    return is_open, next_open
+
+
+def send_message_sms(args):
+    body = (
+        "New call message:\n"
+        f"From: {args.get('caller_name')}\n"
+        f"Number: {args.get('callback_number')}\n"
+        f"Category: {args.get('category')}\n"
+        f"Summary: {args.get('summary')}"
+    )
+    twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body)
+
+
+@app.route("/voice", methods=["POST"])
+def voice():
+    call_sid = request.form.get("CallSid")
+    sessions[call_sid] = []
+
+    is_open, next_open = shop_open_status()
+    spoken, _ = call_claude(call_sid, "[CALL STARTED]", is_open, next_open)
+
+    vr = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action="/gather",
+        method="POST",
+        speech_timeout="auto",
+        timeout=6,
+    )
+    gather.say(spoken, voice="Polly.Matthew")
+    vr.append(gather)
+    vr.say("Sorry, I didn't catch that. Please call back and try again.")
+    vr.hangup()
+    return Response(str(vr), mimetype="text/xml")
+
+
+@app.route("/gather", methods=["POST"])
+def gather():
+    call_sid = request.form.get("CallSid")
+    speech = request.form.get("SpeechResult", "")
+    vr = VoiceResponse()
+
+    if not speech:
+        gather = Gather(
+            input="speech",
+            action="/gather",
+            method="POST",
+            speech_timeout="auto",
+            timeout=6,
+        )
+        gather.say("Sorry, I didn't catch that -- could you say that again?", voice="Polly.Matthew")
+        vr.append(gather)
+        vr.say("Sorry, I'm having trouble hearing you. Please call back. Goodbye.")
+        vr.hangup()
+        return Response(str(vr), mimetype="text/xml")
+
+    is_open, next_open = shop_open_status()
+    spoken, tool_call = call_claude(call_sid, speech, is_open, next_open)
+
+    if spoken:
+        vr.say(spoken, voice="Polly.Matthew")
+
+    if tool_call and tool_call.name == "take_message":
+        send_message_sms(tool_call.input)
+        vr.hangup()
+        sessions.pop(call_sid, None)
+        return Response(str(vr), mimetype="text/xml")
+
+    if tool_call and tool_call.name == "end_call":
+        vr.hangup()
+        sessions.pop(call_sid, None)
+        return Response(str(vr), mimetype="text/xml")
+
+    gather = Gather(
+        input="speech",
+        action="/gather",
+        method="POST",
+        speech_timeout="auto",
+        timeout=6,
+    )
+    vr.append(gather)
+    vr.say("Thanks for calling Twin Wireless. Goodbye.")
+    vr.hangup()
+    return Response(str(vr), mimetype="text/xml")
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return "Twin Wireless phone agent is running."
