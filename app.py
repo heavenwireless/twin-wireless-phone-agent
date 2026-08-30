@@ -46,12 +46,18 @@ LANGUAGES = {
         "name": "English",
         "gather_language": "en-US",
         "voice": "Polly.Joanna",
+        "goodbye": "Thanks for calling Twin Wireless. Goodbye.",
+        "no_catch": "Sorry, I didn't catch that -- could you say that again?",
+        "no_hearing": "Sorry, I'm having trouble hearing you. Please call back. Goodbye.",
         "switch_keywords": ["english", "inglés", "ingles"],
     },
     "es": {
         "name": "Spanish",
         "gather_language": "es-MX",
         "voice": "Polly.Penelope",
+        "goodbye": "Gracias por llamar a Twin Wireless. ¡Hasta luego!",
+        "no_catch": "Perdón, no te escuché bien -- ¿puedes repetir eso?",
+        "no_hearing": "Perdón, tengo problemas para escucharte. Por favor llama de nuevo. Adiós.",
         "switch_keywords": [
             "español",
             "espanol",
@@ -420,7 +426,7 @@ def voice():
     gather = build_gather(language)
     gather.say(spoken, voice=LANGUAGES[language]["voice"])
     vr.append(gather)
-    vr.say("Sorry, I didn't catch that. Please call back and try again.", voice=LANGUAGES[DEFAULT_LANGUAGE]["voice"])
+    vr.say(LANGUAGES[DEFAULT_LANGUAGE]["no_hearing"], voice=LANGUAGES[DEFAULT_LANGUAGE]["voice"])
     vr.hangup()
     return Response(str(vr), mimetype="text/xml")
 
@@ -435,9 +441,9 @@ def gather():
     if not speech:
         language = session["language"]
         gather = build_gather(language)
-        gather.say("Sorry, I didn't catch that -- could you say that again?", voice=LANGUAGES[language]["voice"])
+        gather.say(LANGUAGES[language]["no_catch"], voice=LANGUAGES[language]["voice"])
         vr.append(gather)
-        vr.say("Sorry, I'm having trouble hearing you. Please call back. Goodbye.", voice=LANGUAGES[language]["voice"])
+        vr.say(LANGUAGES[language]["no_hearing"], voice=LANGUAGES[language]["voice"])
         vr.hangup()
         return Response(str(vr), mimetype="text/xml")
 
@@ -469,7 +475,7 @@ def gather():
 
     gather = build_gather(language)
     vr.append(gather)
-    vr.say("Thanks for calling Twin Wireless. Goodbye.", voice=LANGUAGES[language]["voice"])
+    vr.say(LANGUAGES[language]["goodbye"], voice=LANGUAGES[language]["voice"])
     vr.hangup()
     return Response(str(vr), mimetype="text/xml")
 
