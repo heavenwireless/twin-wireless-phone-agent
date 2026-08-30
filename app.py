@@ -259,7 +259,12 @@ def send_message_sms(args):
         f"Category: {args.get('category')}\n"
         f"Summary: {args.get('summary')}"
     )
-    twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body)
+    try:
+        twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body)
+    except Exception as exc:
+        # Never let an SMS failure (e.g. A2P 10DLC/Trust Hub not approved yet) take
+        # down the call -- log it and keep going.
+        print(f"send_message_sms failed: {exc}")
 
 
 def send_financing_link_sms(args, caller_number):
@@ -267,7 +272,10 @@ def send_financing_link_sms(args, caller_number):
         return
     name, link = FINANCING_LINKS.get(args.get("option"), FINANCING_LINKS["acima"])
     body = f"Twin Wireless financing -- {name}: {link}"
-    twilio_client.messages.create(to=caller_number, from_=TWILIO_FROM_NUMBER, body=body)
+    try:
+        twilio_client.messages.create(to=caller_number, from_=TWILIO_FROM_NUMBER, body=body)
+    except Exception as exc:
+        print(f"send_financing_link_sms failed: {exc}")
 
 
 @app.route("/voice", methods=["POST"])
