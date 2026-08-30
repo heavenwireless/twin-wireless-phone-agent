@@ -17,6 +17,21 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 MODEL = "claude-haiku-4-5-20251001"
 
+FINANCING_LINKS = {
+    "acima": (
+        "Acima (lease-to-own)",
+        "https://apply.acima.com/?app_id=lo&location_guid=loca-8ac444c5-f145-4143-ad84-c7ceee62a4ca&utm_medium=merchant&utm_source=web",
+    ),
+    "progressive_leasing": (
+        "Progressive Leasing",
+        "https://approve.me/s/indymobile/108181?utm_source=ProgCentral&utm_medium=email&utm_campaign=q4_promotion#/splash",
+    ),
+    "payvantage": (
+        "Payvantage",
+        "https://payvan.me/3VdV2k7",
+    ),
+}
+
 SYSTEM_PROMPT = """You are the phone assistant for Twin Wireless, a device repair shop
 at 2328 Line Ave, Shreveport, LA 71104, phone (318) 670-3938, website twin-wireless.com.
 Hours: Monday-Saturday 9AM-8PM, Sunday 11AM-5PM.
@@ -82,6 +97,25 @@ IPHONE BACK GLASS REPLACEMENT PRICES (confirmed after inspection):
 
 These two lists are iPhone screen and back glass only. Anything else (including a full back
 housing swap rather than just the glass) follows the free-diagnosis/callback rule above.
+
+OTHER SERVICES (not repairs -- you can talk about these too, they're not out of scope):
+- Prepaid wireless activation: Simple Mobile, AT&T Prepaid, Cricket Wireless, Verizon
+  Prepaid. $25 assisted activation fee, due only after we verify the request. In-store setup
+  takes about 15 minutes; online setup about 30 minutes. Works with eSIM or physical SIM
+  depending on the device.
+- Xfinity Prepaid home internet: Twin Wireless is an authorized Xfinity dealer for prepaid
+  home internet service. There's no set price list -- it depends on the customer's address
+  and what Xfinity is currently offering there, so we have to check their address first.
+  Don't guess a price. Ask for their address and offer to take a message for a callback once
+  we've checked it, or suggest they call back or come in.
+- Bill pay: customers can pay their existing wireless bill in store via Cash App or Zelle
+  only. (Regular in-store purchases are separate and accept cash, cards, Cash App, Zelle, and
+  PayPal -- don't mix the two up if asked.)
+- Financing: Acima (lease-to-own), Progressive Leasing, and Payvantage are all available for
+  device purchases and repairs. If a caller asks about financing or wants to apply, offer to
+  text them the application link right then -- use the send_link tool with whichever option
+  they want. If they're not sure which one, ask, or default to Acima as the most common pick.
+  The link goes to the number they're calling from, so you don't need to ask for a number.
 
 WHEN TO TAKE A MESSAGE (use the take_message tool): the caller doesn't want to come in for a
 free diagnosis and needs a callback instead, a repair status check, the caller wants to speak
@@ -150,6 +184,25 @@ def call_claude(call_sid, user_text, is_open, next_open_text):
                 ),
                 "input_schema": {"type": "object", "properties": {}},
             },
+            {
+                "name": "send_link",
+                "description": (
+                    "Text a financing application link to the caller's own phone number "
+                    "(the number they're calling from). Use when a caller asks about "
+                    "financing or wants to apply. This does not end the call -- keep "
+                    "talking afterward."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "option": {
+                            "type": "string",
+                            "enum": ["acima", "progressive_leasing", "payvantage"],
+                        },
+                    },
+                    "required": ["option"],
+                },
+            },
         ],
         messages=history,
     )
@@ -207,6 +260,14 @@ def send_message_sms(args):
         f"Summary: {args.get('summary')}"
     )
     twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body)
+
+
+def send_financing_link_sms(args, caller_number):
+    if not caller_number or not caller_number.startswith("+"):
+        return
+    name, link = FINANCING_LINKS.get(args.get("option"), FINANCING_LINKS["acima"])
+    body = f"Twin Wireless financing -- {name}: {link}"
+    twilio_client.messages.create(to=caller_number, from_=TWILIO_FROM_NUMBER, body=body)
 
 
 @app.route("/voice", methods=["POST"])
@@ -268,6 +329,9 @@ def gather():
         vr.hangup()
         sessions.pop(call_sid, None)
         return Response(str(vr), mimetype="text/xml")
+
+    if tool_call and tool_call.name == "send_link":
+        send_financing_link_sms(tool_call.input, request.form.get("From"))
 
     gather = Gather(
         input="speech",
