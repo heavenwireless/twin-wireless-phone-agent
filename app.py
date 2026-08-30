@@ -17,6 +17,8 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 MODEL = "claude-haiku-4-5-20251001"
 
+REVIEW_LINK = "https://g.page/r/CdNI_z0bef6qEBM/review"
+
 FINANCING_LINKS = {
     "acima": (
         "Acima (lease-to-own)",
@@ -117,6 +119,15 @@ OTHER SERVICES (not repairs -- you can talk about these too, they're not out of 
   they want. If they're not sure which one, ask, or default to Acima as the most common pick.
   The link goes to the number they're calling from, so you don't need to ask for a number.
 
+ASKING FOR A REVIEW: Only if the caller's own question was fully and directly answered by
+you in this call (never after taking a message -- that means it's still unresolved, and
+never if the caller seemed frustrated, upset, or in a hurry), you can ask once, casually,
+right before saying goodbye -- something like "Hey, if that was helpful, would you mind
+leaving us a quick Google review? I can text you the link right now." If they say yes, use
+the send_review_link tool (no input needed, it texts the caller's own number), say a quick
+thanks, then continue to end_call on your next turn. If they decline or don't respond
+positively, drop it immediately and just say goodbye -- never ask twice or push.
+
 WHEN TO TAKE A MESSAGE (use the take_message tool): the caller doesn't want to come in for a
 free diagnosis and needs a callback instead, a repair status check, the caller wants to speak
 to a person, the caller seems upset, or anything else you can't confidently resolve yourself.
@@ -203,6 +214,16 @@ def call_claude(call_sid, user_text, is_open, next_open_text):
                     "required": ["option"],
                 },
             },
+            {
+                "name": "send_review_link",
+                "description": (
+                    "Text a Google review link to the caller's own phone number. Only use "
+                    "after the caller's question was fully resolved in this call and they "
+                    "agreed to leave a review. This does not end the call -- keep talking "
+                    "afterward."
+                ),
+                "input_schema": {"type": "object", "properties": {}},
+            },
         ],
         messages=history,
     )
@@ -278,6 +299,16 @@ def send_financing_link_sms(args, caller_number):
         print(f"send_financing_link_sms failed: {exc}")
 
 
+def send_review_link_sms(caller_number):
+    if not caller_number or not caller_number.startswith("+"):
+        return
+    body = f"Thanks for calling Twin Wireless! Mind leaving us a quick review? {REVIEW_LINK}"
+    try:
+        twilio_client.messages.create(to=caller_number, from_=TWILIO_FROM_NUMBER, body=body)
+    except Exception as exc:
+        print(f"send_review_link_sms failed: {exc}")
+
+
 @app.route("/voice", methods=["POST"])
 def voice():
     call_sid = request.form.get("CallSid")
@@ -340,6 +371,9 @@ def gather():
 
     if tool_call and tool_call.name == "send_link":
         send_financing_link_sms(tool_call.input, request.form.get("From"))
+
+    if tool_call and tool_call.name == "send_review_link":
+        send_review_link_sms(request.form.get("From"))
 
     gather = Gather(
         input="speech",
