@@ -49,6 +49,7 @@ LANGUAGES = {
         "goodbye": "Thanks for calling Twin Wireless. Goodbye.",
         "no_catch": "Sorry, I didn't catch that -- could you say that again?",
         "no_hearing": "Sorry, I'm having trouble hearing you. Please call back. Goodbye.",
+        "message_taken_fallback": "Got it, thanks -- we'll give you a call back soon!",
         "switch_keywords": ["english", "inglés", "ingles"],
     },
     "es": {
@@ -58,6 +59,7 @@ LANGUAGES = {
         "goodbye": "Gracias por llamar a Twin Wireless. ¡Hasta luego!",
         "no_catch": "Perdón, no te escuché bien -- ¿puedes repetir eso?",
         "no_hearing": "Perdón, tengo problemas para escucharte. Por favor llama de nuevo. Adiós.",
+        "message_taken_fallback": "Listo, gracias -- te llamaremos pronto.",
         "switch_keywords": [
             "español",
             "espanol",
@@ -460,6 +462,8 @@ def gather():
         vr.say(spoken, voice=LANGUAGES[language]["voice"])
 
     if tool_call and tool_call.name == "take_message":
+        if not spoken:
+            vr.say(LANGUAGES[language]["message_taken_fallback"], voice=LANGUAGES[language]["voice"])
         send_message_sms(tool_call.input)
         vr.hangup()
         sessions.pop(call_sid, None)
