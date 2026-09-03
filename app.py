@@ -467,8 +467,14 @@ def voice():
     gather = build_gather(language)
     gather.say(spoken, voice=LANGUAGES[language]["voice"])
     vr.append(gather)
-    vr.say(LANGUAGES[DEFAULT_LANGUAGE]["no_hearing"], voice=LANGUAGES[DEFAULT_LANGUAGE]["voice"])
-    vr.hangup()
+    # A silent Gather (nothing recognized) does not POST to /gather -- Twilio
+    # just falls through to the next verb in THIS response. Ending here would
+    # give the caller's very first turn zero retries, unlike every later turn
+    # (see /gather's own empty-speech branch below), so one bad connection on
+    # the opening line was an instant hangup with no second chance. Redirecting
+    # to /gather with no SpeechResult reuses that existing retry instead of
+    # duplicating it.
+    vr.redirect("/gather", method="POST")
     return Response(str(vr), mimetype="text/xml")
 
 
