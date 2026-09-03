@@ -234,7 +234,31 @@ def detect_language(text, current_language):
     return current_language
 
 
-def call_claude(call_sid, user_text, is_open, next_open_text):
+# SYSTEM_PROMPT is written for voice ("You are answering a live phone call...
+# spoken aloud by text-to-speech"). Reusing it verbatim for SMS made Mia open a
+# text with "Thanks for calling", and the prompt's Spanish example begins with
+# "--", which the model glued an English "and" onto: "-- and y también hablo
+# español". Both were live in a real customer text.
+#
+# Rather than fork the prompt, SMS appends an override. Last instruction wins,
+# and the voice path is untouched.
+SMS_CHANNEL_NOTE = """
+
+CHANNEL OVERRIDE -- THIS IS A TEXT MESSAGE, NOT A PHONE CALL.
+Everything above about speaking, text-to-speech and calls still applies to your
+tone, but adapt the wording to a text conversation:
+- Never say "calling", "on the phone", "I hear you" or "Thanks for calling".
+  Say "texting"/"messaging", or simply don't reference the channel at all.
+- Do not begin with "and" before the Spanish line. Offer Spanish as its own
+  clean sentence, e.g. "Tambien hablo espanol si prefieres." -- and only in
+  your first reply of a thread, never again.
+- Short paragraphs are fine, but keep the whole reply under about 320
+  characters so it does not split into several billed SMS segments.
+- No emoji.
+"""
+
+
+def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice"):
     session = sessions.setdefault(call_sid, {"history": [], "language": DEFAULT_LANGUAGE})
     history = session["history"]
     language_name = LANGUAGES[session["language"]]["name"]
@@ -253,7 +277,7 @@ def call_claude(call_sid, user_text, is_open, next_open_text):
     response = claude.messages.create(
         model=MODEL,
         max_tokens=300,
-        system=SYSTEM_PROMPT,
+        system=SYSTEM_PROMPT + (SMS_CHANNEL_NOTE if channel == "sms" else ""),
         tools=[
             {
                 "name": "take_message",
@@ -521,7 +545,7 @@ def sms():
 
     is_open, next_open = shop_open_status()
     try:
-        spoken, tool_call = call_claude(session_key, body, is_open, next_open)
+        spoken, tool_call = call_claude(session_key, body, is_open, next_open, channel="sms")
     except Exception as exc:  # noqa: BLE001
         # Never leave a texter with silence. Falling back to the shop's real
         # contact details is always safe and never wrong.
