@@ -345,13 +345,19 @@ def call_claude(call_sid, user_text, is_open, next_open_text):
 
 
 def shop_open_status():
-    # Mon-Sat 9AM-8PM, Sun 11AM-5PM, America/Chicago. Render's default TZ is UTC,
-    # so this converts using a fixed offset -- good enough for CST/CDT most of the
-    # year; revisit if DST edge cases matter.
+    # Mon-Sat 9AM-8PM, Sun 11AM-5PM, America/Chicago.
+    #
+    # This used to subtract a hardcoded 5 hours from UTC. That is only correct
+    # during daylight time: Central is UTC-5 in CDT but UTC-6 in CST, so from
+    # the November DST change until March the agent would have been a full hour
+    # off -- telling callers the shop was open at 8 AM when it was closed, and
+    # closed at 8 PM when it was still open. ZoneInfo applies the correct offset
+    # year-round, including across the switch. (post_daily.py in the sibling
+    # social-publisher repo already does it this way.)
     import datetime
+    from zoneinfo import ZoneInfo
 
-    now_utc = datetime.datetime.utcnow()
-    now_central = now_utc - datetime.timedelta(hours=5)  # approx CDT offset
+    now_central = datetime.datetime.now(ZoneInfo("America/Chicago"))
     weekday = now_central.weekday()  # Mon=0 .. Sun=6
     hour = now_central.hour + now_central.minute / 60
 
