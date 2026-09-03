@@ -406,6 +406,35 @@ def shop_open_status():
     return is_open, next_open
 
 
+# The opening line used to come from call_claude(), which means every single
+# call paid for a live Claude API round-trip before Mia said one word. A real
+# forwarded call on 2026-09-03 confirmed this is not just theoretical: /voice
+# took 1293ms to respond, and the entire call lasted 4 seconds total -- not
+# nearly long enough for the greeting to have even finished playing, meaning
+# the caller hung up during the silence WHILE THAT REQUEST WAS STILL RUNNING.
+# The caller never even reached the Gather window the earlier fixes address.
+#
+# This removes Claude from the critical path for the greeting entirely.
+# shop_open_status() is pure local computation (datetime math, no network
+# call), so this function has zero external dependencies and should resolve
+# in low single-digit milliseconds even on a cold path. The trade-off is a
+# fixed opening line instead of one Claude phrases fresh each time; given the
+# alternative is calls dropping before anyone hears anything, that trade is
+# clearly worth it. The real conversation still starts fully AI-driven on the
+# caller's first actual reply, handled in /gather as before.
+def opening_greeting(is_open, next_open_text):
+    if is_open:
+        return (
+            "Hey there! This is Mia from Twin Wireless. What can I help you with today? "
+            "-- and I also speak Spanish, if you prefer."
+        )
+    return (
+        f"Hey there! This is Mia from Twin Wireless. We're closed right now, back open "
+        f"{next_open_text} -- but go ahead and tell me what's going on, I'll do what I can. "
+        "-- and I also speak Spanish, if you prefer."
+    )
+
+
 def send_message_sms(args):
     body = (
         "New call message:\n"
@@ -470,9 +499,9 @@ def voice():
     sessions[call_sid] = {"history": [], "language": DEFAULT_LANGUAGE}
 
     is_open, next_open = shop_open_status()
-    spoken, _ = call_claude(call_sid, "[CALL STARTED]", is_open, next_open)
+    spoken = opening_greeting(is_open, next_open)
 
-    language = sessions[call_sid]["language"]
+    language = DEFAULT_LANGUAGE
     vr = VoiceResponse()
     gather = build_gather(language)
     gather.say(spoken, voice=LANGUAGES[language]["voice"])
