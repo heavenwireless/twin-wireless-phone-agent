@@ -449,7 +449,17 @@ def build_gather(language):
         action="/gather",
         method="POST",
         speech_timeout="auto",
-        timeout=6,
+        # Was 6. Two real forwarded test calls both ended at EXACTLY
+        # greeting-length + 6s, matching the retry-generation timestamp in
+        # Twilio's own logs to the second -- the caller sat through 6 full
+        # seconds of total silence after the greeting, with no audio at all,
+        # and hung up right as the retry ("Sorry, I didn't catch that...")
+        # was being fetched, never hearing it. The retry logic itself is
+        # correct (confirmed in the TwiML Twilio actually returned); the
+        # problem is 6s of dead air reads as a dropped call before it ever
+        # gets a chance to speak. Shortened so a quiet moment resolves into
+        # audible feedback faster than a caller's patience runs out.
+        timeout=4,
         language=LANGUAGES[language]["gather_language"],
     )
 
