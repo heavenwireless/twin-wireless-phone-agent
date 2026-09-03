@@ -2,6 +2,7 @@ import os
 import re
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 import anthropic
 
@@ -491,6 +492,68 @@ def gather():
     vr.say(LANGUAGES[language]["goodbye"], voice=LANGUAGES[language]["voice"])
     vr.hangup()
     return Response(str(vr), mimetype="text/xml")
+
+
+@app.route("/sms", methods=["POST"])
+def sms():
+    # Texts to the shop number, answered by the same Mia that answers calls:
+    # same SYSTEM_PROMPT, same brand facts, same hours logic, same tools.
+    #
+    # Before this existed the number's messaging webhook still pointed at
+    # Twilio's demo endpoint, so a customer texting the shop got a canned
+    # Twilio autoreply.
+    #
+    # Session key is the CALLER'S NUMBER, not a CallSid. A call is one
+    # continuous session that ends on hangup; a text conversation has no
+    # hangup, so history is keyed per person and reused across messages. That
+    # is what lets someone ask a follow-up ("what about the 13?") and be
+    # understood.
+    from_number = request.form.get("From", "")
+    body = (request.form.get("Body") or "").strip()
+
+    resp = MessagingResponse()
+    if not body:
+        return Response(str(resp), mimetype="text/xml")
+
+    session_key = f"sms:{from_number}"
+    session = sessions.setdefault(session_key, {"history": [], "language": DEFAULT_LANGUAGE})
+    session["language"] = detect_language(body, session["language"])
+
+    is_open, next_open = shop_open_status()
+    try:
+        spoken, tool_call = call_claude(session_key, body, is_open, next_open)
+    except Exception as exc:  # noqa: BLE001
+        # Never leave a texter with silence. Falling back to the shop's real
+        # contact details is always safe and never wrong.
+        print(f"SMS: Claude call failed: {exc}")
+        resp.message(
+            "Sorry, I'm having trouble right now. Please call (318) 670-3938 "
+            "or come by 2328 Line Ave, Shreveport."
+        )
+        return Response(str(resp), mimetype="text/xml")
+
+    # take_message on SMS means the texter wants a human. The message still
+    # goes to the owner, but there is no call to hang up -- the thread simply
+    # continues, so the session is kept rather than popped.
+    if tool_call and tool_call.name == "take_message":
+        send_message_sms(tool_call.input)
+        if not spoken:
+            spoken = LANGUAGES[session["language"]]["message_taken_fallback"]
+
+    if tool_call and tool_call.name == "send_link":
+        send_financing_link_sms(tool_call.input, from_number)
+
+    if tool_call and tool_call.name == "send_review_link":
+        send_review_link_sms(from_number)
+
+    # end_call has no meaning in a text thread; the reply is just sent.
+    if spoken:
+        # SMS segments bill per 160 chars, and Claude is capped at 300 tokens
+        # anyway, but trim defensively so one long reply cannot fan out into
+        # many billable segments.
+        resp.message(spoken[:1200])
+
+    return Response(str(resp), mimetype="text/xml")
 
 
 @app.route("/", methods=["GET"])
