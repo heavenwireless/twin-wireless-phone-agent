@@ -242,9 +242,47 @@ specifically fails only on the conditional-call-forwarding path — a direct
 call to the same destination number has perfect audio. This isolates the bug
 to their forwarding trunk's media handling, not the number, not the app.
 
+**Refined 2026-09-03 evening, after Murad called AT&T again and re-tried the
+conditional-forwarding codes — still broken, but with a sharper symptom
+breakdown that narrows this further than the framing above:**
+
+- **Unreachable (phone off / airplane mode) → working audio.** Mia answers
+  and the caller hears her normally.
+- **No answer** and **busy/rejected** → **silent for ~20 seconds, then the
+  call ends** — matching the app's own full script duration (greeting →
+  retry → goodbye → app-initiated hangup), meaning the app runs to
+  completion exactly as before, the caller just never hears any of it.
+
+All three conditions point at the identical destination number, so this
+isn't "conditional forwarding is broken" broadly — it's specifically the
+**no-answer and busy/rejected forwarding triggers** misbehaving while the
+**unreachable** trigger, to that same number, works fine. That's a much
+more specific fact for AT&T's network team than what they'd been given
+before, and worth leading with on the next contact:
+
+> "Conditional forwarding for unreachable (phone off) has clear, working
+> audio to 318-723-9666. Conditional forwarding for no-answer and
+> busy/rejected, to that exact same number, is completely silent for about
+> 20 seconds before the call ends — even though the call connects and runs
+> normally the whole time. Since all three point at the identical
+> destination, this isolates the problem to how your network specifically
+> handles the no-answer and busy/rejected forwarding triggers, not the
+> unreachable one. I need this checked against your provisioning changes,
+> not re-tested with the same settings again."
+
+Also confirmed by diff against Render's deploy history: nothing in
+`build_gather`/`/voice`/`/gather` (or anything else that could affect call
+audio) has changed since Murad's last known-good date, **2026-09-01** —
+every commit since then touches only SMS handling, hours-math, or
+retry/timeout timing, none of it audio delivery. Combined with Twilio's own
+number config being unchanged and plain, the app/Twilio side is provably
+constant across the whole "it worked, then it broke" window. Whatever
+changed, changed on AT&T's network.
+
 **No further action possible from the app/Render side.** This is blocked on
-Murad calling AT&T with that framing, or on new symptoms/logs from a fresh
-test call.
+AT&T actually escalating past front-line support to whoever can see their
+own provisioning history and the no-answer/busy-vs-unreachable distinction
+above, or on new symptoms/logs from a fresh test call.
 
 ## Render check (2026-09-03) — thorough, all clean
 
