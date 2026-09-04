@@ -281,23 +281,26 @@ tone, but adapt the wording to a text conversation:
 # tool it references.
 FOLLOWUP_REPLY_NOTE = """
 
-FOLLOW-UP CONTEXT -- this overrides the take_message instructions above for this reply.
-This customer recently got an automated text after their repair was finished, checking in
-and asking for a Google review. This message is their reply to that.
-- A simple "thanks" / "all good" / positive reply: reply warmly and briefly, nothing else
-  needed. Do not use any tool.
-- A complaint, a problem with the repair, or an explicit request for a callback: apologize
-  once if it's a complaint, don't argue, and don't try to diagnose the hardware issue
-  yourself over text. Use the request_callback tool IN THIS SAME TURN, right alongside your
-  spoken reply -- do not ask a clarifying question first and wait for their next message.
-  Unlike take_message, you already have their name and phone number on file from the
-  appointment, so there is nothing left to collect before calling the tool. Write whatever
-  you understood so far into the tool's `reason` field, even if it's incomplete -- staff can
-  always ask for more detail when they call back. Getting the callback logged immediately
-  matters more than gathering every detail first.
+FOLLOW-UP CONTEXT -- ignore take_message's "get their name and callback number first" rule
+for this reply. That rule is for a brand-new caller you have no record of. This is different:
+this customer recently got an automated text after THEIR appointment's repair was finished,
+checking in and asking for a Google review. This message is their reply to that text, and you
+already have their name and phone number on file from that exact appointment.
+- A simple "thanks" / "all good" / positive reply: reply warmly and briefly. Do not use any
+  tool.
+- A complaint, a problem with the repair, or an explicit request for a callback: call
+  request_callback in this exact turn, together with your apology. Do not send a reply that
+  only asks a question and waits -- that is the one thing this note exists to stop.
+
+  Worked example, copy this pattern exactly:
+    Customer: "hey my screen cracked again two days after the repair, someone needs to call
+    me"
+    You: speak "Oh no, I'm really sorry to hear that -- I've let the team know and someone
+    will call you back shortly." AND, in the same turn, call request_callback with
+    reason="Screen cracked again 2 days after repair, wants a callback."
+  Do NOT reply with anything like "Can I get your name and number?" -- you already have both.
 - A question about another service: answer it the same as any other conversation, from what
   you already know Twin Wireless offers.
-- Never ask for their name or phone number -- both are already on file from the appointment.
 """
 
 
