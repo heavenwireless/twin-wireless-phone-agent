@@ -1,5 +1,9 @@
+import datetime
 import os
 import re
+import requests
+from zoneinfo import ZoneInfo
+from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.twiml.messaging_response import MessagingResponse
@@ -13,6 +17,15 @@ TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_FROM_NUMBER = os.environ["TWILIO_FROM_NUMBER"]
 OWNER_PHONE = os.environ["OWNER_PHONE"]
+
+# Automated post-repair follow-up agent. Optional on purpose: these are read
+# with .get(), not os.environ[...], so deploying this code before the admin
+# credential exists on Render never breaks the phone/SMS service that's
+# already live -- the follow-up cycle just no-ops and logs until configured.
+ADMIN_API_BASE = os.environ.get("ADMIN_API_BASE", "https://www.twin-wireless.com")
+ADMIN_API_USER = os.environ.get("ADMIN_API_USER")
+ADMIN_API_PASS = os.environ.get("ADMIN_API_PASS")
+FOLLOWUP_POLL_SECONDS = 300
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -262,8 +275,28 @@ tone, but adapt the wording to a text conversation:
 - No emoji.
 """
 
+# Appended only when this /sms turn is a reply to an automated post-repair
+# follow-up text (see _followup_context / run_followup_cycle below), so a
+# normal fresh call or text never sees this note or the request_callback
+# tool it references.
+FOLLOWUP_REPLY_NOTE = """
 
-def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice"):
+FOLLOW-UP CONTEXT -- this customer recently got an automated text after their repair was
+finished, checking in and asking for a Google review. This message is their reply to that.
+- A simple "thanks" / "all good" / positive reply: reply warmly and briefly, nothing else
+  needed.
+- A complaint or a problem with the repair: apologize once, don't argue, and don't try to
+  diagnose the hardware issue yourself over text -- use the request_callback tool so a team
+  member follows up.
+- An explicit request for a callback: use the request_callback tool.
+- A question about another service: answer it the same as any other conversation, from what
+  you already know Twin Wireless offers.
+- Never re-ask for their name or phone number -- both are already on file from the
+  appointment.
+"""
+
+
+def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice", followup_reply=False):
     session = sessions.setdefault(call_sid, {"history": [], "language": DEFAULT_LANGUAGE})
     history = session["history"]
     language_name = LANGUAGES[session["language"]]["name"]
@@ -279,11 +312,13 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice"):
         }
     )
 
-    response = claude.messages.create(
-        model=MODEL,
-        max_tokens=300,
-        system=SYSTEM_PROMPT + (SMS_CHANNEL_NOTE if channel == "sms" else ""),
-        tools=[
+    system_prompt = SYSTEM_PROMPT
+    if channel == "sms":
+        system_prompt += SMS_CHANNEL_NOTE
+    if followup_reply:
+        system_prompt += FOLLOWUP_REPLY_NOTE
+
+    tools = [
             {
                 "name": "take_message",
                 "description": (
@@ -352,7 +387,38 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice"):
                 ),
                 "input_schema": {"type": "object", "properties": {}},
             },
-        ],
+    ]
+
+    if followup_reply:
+        tools.append(
+            {
+                "name": "request_callback",
+                "description": (
+                    "Create a staff callback request for this customer, visible on the "
+                    "Admin follow-up dashboard and texted to the shop right away. Use when "
+                    "a customer replying to a post-repair follow-up reports a problem, has "
+                    "a complaint, or explicitly asks for a callback. Never use this for a "
+                    "brand-new caller/texter unrelated to a follow-up -- use take_message "
+                    "instead in that case."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {
+                            "type": "string",
+                            "description": "Brief summary of what the customer needs, for staff.",
+                        },
+                    },
+                    "required": ["reason"],
+                },
+            }
+        )
+
+    response = claude.messages.create(
+        model=MODEL,
+        max_tokens=300,
+        system=system_prompt,
+        tools=tools,
         messages=history,
     )
 
@@ -472,6 +538,271 @@ def send_review_link_sms(caller_number):
         print(f"send_review_link_sms failed: {exc}")
 
 
+def send_callback_request_sms(reason, phone, appointment_id):
+    body = (
+        "Follow-up callback requested:\n"
+        f"Number: {phone}\n"
+        f"Appointment: {appointment_id}\n"
+        f"Reason: {reason}"
+    )
+    try:
+        twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body)
+    except Exception as exc:
+        print(f"send_callback_request_sms failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Automated post-repair follow-up agent.
+#
+# The admin panel and its data (appointments, follow-up tracking, settings)
+# live on the twin-wireless.com server, not here -- this app polls that API
+# on a schedule, decides what's due, sends the text (reusing the same
+# twilio_client already set up above), and writes the result back so state
+# survives a restart/redeploy of THIS service. See
+# twin-wireless.com/app/admin/follow-ups/FollowUpManager.jsx for the
+# matching admin dashboard, and STATUS.md for the full design writeup.
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_DEFAULT_SETTINGS = {
+    "enabled": True,
+    "delayHours": 24,
+    "sendingHoursStart": 9,
+    "sendingHoursEnd": 20,
+    "googleReviewUrl": REVIEW_LINK,
+    "websiteUrl": "https://www.twin-wireless.com",
+    "maxRetries": 3,
+    "serviceRecommendationsEnabled": True,
+}
+
+# Checked before anything else in /sms for a customer replying to a follow-up
+# -- unconditional and keyword-based on purpose (reliability over nuance) so
+# an opt-out is never missed because Claude interpreted the reply oddly.
+OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "cancel", "quit", "end", "stopall"}
+
+
+def _admin_api_request(method, path, params=None, json_body=None, auth=True):
+    url = f"{ADMIN_API_BASE}{path}"
+    creds = (ADMIN_API_USER, ADMIN_API_PASS) if auth else None
+    response = requests.request(method, url, params=params, json=json_body, auth=creds, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def _admin_api_get(path, params=None, auth=True):
+    return _admin_api_request("GET", path, params=params, auth=auth)
+
+
+def _admin_api_post(path, payload, auth=True):
+    return _admin_api_request("POST", path, json_body=payload, auth=auth)
+
+
+def _admin_api_patch(path, payload, auth=True):
+    return _admin_api_request("PATCH", path, json_body=payload, auth=auth)
+
+
+def get_followup_settings():
+    try:
+        data = _admin_api_get("/admin-api/site-settings.php", auth=False)
+    except Exception as exc:
+        print(f"Follow-up agent: could not read site-settings, using defaults: {exc}")
+        return dict(FOLLOWUP_DEFAULT_SETTINGS)
+    settings = dict(FOLLOWUP_DEFAULT_SETTINGS)
+    settings.update(data.get("followUps") or {})
+    return settings
+
+
+def _service_recommendation(appointment):
+    # Pulled live from the real catalog every time -- never a hardcoded
+    # list, so this can never recommend a service Twin Wireless doesn't
+    # actually currently offer (or has taken down).
+    try:
+        catalog = _admin_api_get("/api/catalog.php", auth=False).get("items", [])
+    except Exception as exc:
+        print(f"Follow-up agent: could not read catalog for recommendation: {exc}")
+        return None
+
+    repaired = {(r.get("repair") or "").strip().lower() for r in appointment.get("repairs", [])}
+    candidates = [
+        item.get("name") for item in catalog
+        if item.get("name") and item.get("name").strip().lower() not in repaired
+    ]
+    if not candidates:
+        return None
+    return f"Also, if it's ever useful, we also do {candidates[0]} -- just ask next time you're in."
+
+
+def _build_followup_message(appointment, settings):
+    first_name = (appointment.get("firstName") or "").strip() or "there"
+    review_url = settings.get("googleReviewUrl") or REVIEW_LINK
+    website_url = settings.get("websiteUrl") or "https://www.twin-wireless.com"
+
+    parts = [
+        f"Hi {first_name}! This is Twin Wireless. We wanted to check in and make sure "
+        "everything is working great after your recent visit. We really appreciate your "
+        "business!",
+        "If you had a great experience, we'd really appreciate an honest Google review "
+        f"about it: {review_url}",
+    ]
+
+    if settings.get("serviceRecommendationsEnabled", True):
+        recommendation = _service_recommendation(appointment)
+        if recommendation:
+            parts.append(recommendation)
+
+    parts.append(
+        "And if you ever need phone repair, accessories, upgrades, activation, or anything "
+        f"else we offer, everything's here: {website_url}"
+    )
+
+    return " ".join(parts)[:1400]
+
+
+def _send_followup_sms(appointment, settings):
+    phone = appointment.get("phone", "")
+    if not phone.startswith("+"):
+        return False, "appointment has no usable phone number"
+    body = _build_followup_message(appointment, settings)
+    try:
+        twilio_client.messages.create(to=phone, from_=TWILIO_FROM_NUMBER, body=body)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def run_followup_cycle():
+    if not (ADMIN_API_USER and ADMIN_API_PASS):
+        # Not configured yet -- see STATUS.md for how to set
+        # ADMIN_API_USER/ADMIN_API_PASS. Never fatal: the phone/SMS service
+        # this scheduler lives inside must keep working either way.
+        return
+
+    settings = get_followup_settings()
+    if not settings.get("enabled", True):
+        return
+
+    try:
+        appointments = _admin_api_get("/admin-api/appointments.php").get("appointments", [])
+    except Exception as exc:
+        print(f"Follow-up cycle: could not fetch appointments: {exc}")
+        return
+
+    fulfilled = [a for a in appointments if a.get("status") == "Fulfilled" and a.get("fulfilledAt")]
+
+    # Idempotent: POST only creates a tracking record if one doesn't already
+    # exist for this appointment id, so re-polling or restarting never
+    # double-schedules or double-sends.
+    for appointment in fulfilled:
+        try:
+            _admin_api_post(
+                "/admin-api/followups.php",
+                {
+                    "appointmentId": appointment["id"],
+                    "phone": appointment.get("phone", ""),
+                    "fulfilledAt": appointment["fulfilledAt"],
+                },
+            )
+        except Exception as exc:
+            print(f"Follow-up cycle: could not ensure record for {appointment.get('id')}: {exc}")
+
+    try:
+        records = _admin_api_get("/admin-api/followups.php").get("followups", [])
+    except Exception as exc:
+        print(f"Follow-up cycle: could not fetch followups: {exc}")
+        return
+
+    appointment_by_id = {str(a.get("id")): a for a in appointments}
+    now = datetime.datetime.now(ZoneInfo("America/Chicago"))
+    delay_hours = settings.get("delayHours", 24)
+    start_hour = settings.get("sendingHoursStart", 9)
+    end_hour = settings.get("sendingHoursEnd", 20)
+    max_retries = settings.get("maxRetries", 3)
+
+    for record in records:
+        if record.get("optedOut") or record.get("followUpStatus") in ("sent", "failed"):
+            continue
+
+        appointment = appointment_by_id.get(str(record.get("appointmentId")))
+        if not appointment or appointment.get("status") != "Fulfilled":
+            # Re-verification per spec: status changed since it was recorded
+            # fulfilled (e.g. reopened) -- don't send.
+            continue
+
+        scheduled_at = record.get("followupScheduledAt")
+        if not scheduled_at:
+            try:
+                fulfilled_at = datetime.datetime.fromisoformat(
+                    record["fulfilledAt"].replace("Z", "+00:00")
+                )
+            except (KeyError, ValueError):
+                continue
+            scheduled_dt = fulfilled_at + datetime.timedelta(hours=delay_hours)
+            try:
+                _admin_api_patch(
+                    "/admin-api/followups.php",
+                    {"appointmentId": record["appointmentId"], "followupScheduledAt": scheduled_dt.isoformat()},
+                )
+            except Exception as exc:
+                print(f"Follow-up cycle: could not set schedule for {record.get('appointmentId')}: {exc}")
+            continue
+
+        try:
+            scheduled_dt = datetime.datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if now < scheduled_dt:
+            continue  # not due yet
+
+        if not (start_hour <= now.hour < end_hour):
+            # Outside sending hours -- stays queued, the next poll inside
+            # the window picks it up. Nothing to do this cycle.
+            continue
+
+        if record.get("attempts", 0) >= max_retries:
+            continue  # already exhausted retries, sitting in Needs Staff Attention
+
+        sent_ok, error = _send_followup_sms(appointment, settings)
+        appointment_id = record["appointmentId"]
+        if sent_ok:
+            try:
+                _admin_api_patch(
+                    "/admin-api/followups.php",
+                    {
+                        "appointmentId": appointment_id,
+                        "followupSentAt": now.isoformat(),
+                        "followUpStatus": "sent",
+                        "reviewRequestSent": True,
+                    },
+                )
+            except Exception as exc:
+                print(f"Follow-up cycle: sent but could not record it for {appointment_id}: {exc}")
+        else:
+            attempts = record.get("attempts", 0) + 1
+            patch = {"appointmentId": appointment_id, "attempts": attempts, "lastError": str(error)[:500]}
+            if attempts >= max_retries:
+                patch["followUpStatus"] = "failed"
+                patch["staffFollowupRequired"] = True
+            try:
+                _admin_api_patch("/admin-api/followups.php", patch)
+            except Exception as exc:
+                print(f"Follow-up cycle: send failed AND could not record failure for {appointment_id}: {exc}")
+
+
+def _followup_context(phone):
+    """The most recent SENT follow-up record for this phone, if any -- used
+    by /sms to decide whether an inbound text is a reply to a follow-up
+    (opt-out handling, request_callback tool, FOLLOWUP_REPLY_NOTE) or just a
+    normal fresh conversation."""
+    if not (ADMIN_API_USER and ADMIN_API_PASS) or not phone:
+        return None
+    try:
+        records = _admin_api_get("/admin-api/followups.php", params={"phone": phone}).get("followups", [])
+    except Exception as exc:
+        print(f"_followup_context: could not fetch followups for {phone}: {exc}")
+        return None
+    sent = [r for r in records if r.get("followUpStatus") == "sent"]
+    return sent[-1] if sent else None
+
+
 def build_gather(language):
     return Gather(
         input="speech",
@@ -589,13 +920,39 @@ def sms():
     if not body:
         return Response(str(resp), mimetype="text/xml")
 
+    # A reply to an automated post-repair follow-up text is handled
+    # differently from a fresh customer message -- see FOLLOWUP_REPLY_NOTE
+    # and run_followup_cycle() above. followup_record is None for any
+    # ordinary call/text, so none of this changes existing behavior.
+    followup_record = _followup_context(from_number)
+    if followup_record:
+        lowered = re.sub(r"[^a-z ]", "", body.lower()).strip()
+        if lowered in OPT_OUT_KEYWORDS:
+            try:
+                _admin_api_patch(
+                    "/admin-api/followups.php",
+                    {
+                        "appointmentId": followup_record["appointmentId"],
+                        "optedOut": True,
+                        "customerResponse": body[:500],
+                    },
+                )
+            except Exception as exc:
+                print(f"opt-out record failed: {exc}")
+            # Unconditional and independent of Claude on purpose -- an
+            # opt-out must never be missed because a reply was ambiguous.
+            resp.message("You're unsubscribed from Twin Wireless follow-up texts. Text us any time if you need us again.")
+            return Response(str(resp), mimetype="text/xml")
+
     session_key = f"sms:{from_number}"
     session = sessions.setdefault(session_key, {"history": [], "language": DEFAULT_LANGUAGE})
     session["language"] = detect_language(body, session["language"])
 
     is_open, next_open = shop_open_status()
     try:
-        spoken, tool_call = call_claude(session_key, body, is_open, next_open, channel="sms")
+        spoken, tool_call = call_claude(
+            session_key, body, is_open, next_open, channel="sms", followup_reply=bool(followup_record)
+        )
     except Exception as exc:  # noqa: BLE001
         # Never leave a texter with silence. Falling back to the shop's real
         # contact details is always safe and never wrong.
@@ -605,6 +962,15 @@ def sms():
             "or come by 2328 Line Ave, Shreveport."
         )
         return Response(str(resp), mimetype="text/xml")
+
+    if followup_record:
+        try:
+            _admin_api_patch(
+                "/admin-api/followups.php",
+                {"appointmentId": followup_record["appointmentId"], "customerResponse": body[:500]},
+            )
+        except Exception as exc:
+            print(f"record customerResponse failed: {exc}")
 
     # take_message on SMS means the texter wants a human. The message still
     # goes to the owner, but there is no call to hang up -- the thread simply
@@ -620,6 +986,23 @@ def sms():
     if tool_call and tool_call.name == "send_review_link":
         send_review_link_sms(from_number)
 
+    if tool_call and tool_call.name == "request_callback" and followup_record:
+        reason = tool_call.input.get("reason", "")
+        send_callback_request_sms(reason, from_number, followup_record["appointmentId"])
+        try:
+            _admin_api_patch(
+                "/admin-api/followups.php",
+                {
+                    "appointmentId": followup_record["appointmentId"],
+                    "callbackRequested": True,
+                    "staffFollowupRequired": True,
+                },
+            )
+        except Exception as exc:
+            print(f"callback record failed: {exc}")
+        if not spoken:
+            spoken = "Got it -- we'll have someone from the team reach out to you soon."
+
     # end_call has no meaning in a text thread; the reply is just sent.
     if spoken:
         # SMS segments bill per 160 chars, and Claude is capped at 300 tokens
@@ -633,3 +1016,37 @@ def sms():
 @app.route("/", methods=["GET"])
 def health():
     return "Twin Wireless phone agent is running."
+
+
+@app.route("/followups/status", methods=["GET"])
+def followups_status():
+    # Cheap health check for the follow-up agent specifically, separate from
+    # "/" -- used by the Routines check-in so a broken poller (bad admin-api
+    # credentials, site-settings unreachable, etc.) shows up on its own
+    # instead of hiding behind an otherwise-healthy phone service.
+    if not (ADMIN_API_USER and ADMIN_API_PASS):
+        return {"configured": False}
+    try:
+        records = _admin_api_get("/admin-api/followups.php").get("followups", [])
+    except Exception as exc:
+        return {"configured": True, "error": str(exc)}, 502
+    return {
+        "configured": True,
+        "total": len(records),
+        "pending": sum(1 for r in records if r.get("followUpStatus") == "pending" and not r.get("optedOut")),
+        "sent": sum(1 for r in records if r.get("followUpStatus") == "sent"),
+        "needsStaffAttention": sum(1 for r in records if r.get("staffFollowupRequired")),
+        "optedOut": sum(1 for r in records if r.get("optedOut")),
+    }
+
+
+# Single gunicorn worker (see README's Start command: `gunicorn app:app`, no
+# --workers flag), so this runs exactly once per deploy, not once per
+# worker. A failure here must never take the whole app down with it --
+# that's already the phone/SMS service customers are calling right now.
+try:
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(run_followup_cycle, "interval", seconds=FOLLOWUP_POLL_SECONDS, next_run_time=datetime.datetime.now())
+    scheduler.start()
+except Exception as exc:
+    print(f"Follow-up agent: scheduler failed to start: {exc}")
