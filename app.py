@@ -281,18 +281,23 @@ tone, but adapt the wording to a text conversation:
 # tool it references.
 FOLLOWUP_REPLY_NOTE = """
 
-FOLLOW-UP CONTEXT -- this customer recently got an automated text after their repair was
-finished, checking in and asking for a Google review. This message is their reply to that.
+FOLLOW-UP CONTEXT -- this overrides the take_message instructions above for this reply.
+This customer recently got an automated text after their repair was finished, checking in
+and asking for a Google review. This message is their reply to that.
 - A simple "thanks" / "all good" / positive reply: reply warmly and briefly, nothing else
-  needed.
-- A complaint or a problem with the repair: apologize once, don't argue, and don't try to
-  diagnose the hardware issue yourself over text -- use the request_callback tool so a team
-  member follows up.
-- An explicit request for a callback: use the request_callback tool.
+  needed. Do not use any tool.
+- A complaint, a problem with the repair, or an explicit request for a callback: apologize
+  once if it's a complaint, don't argue, and don't try to diagnose the hardware issue
+  yourself over text. Use the request_callback tool IN THIS SAME TURN, right alongside your
+  spoken reply -- do not ask a clarifying question first and wait for their next message.
+  Unlike take_message, you already have their name and phone number on file from the
+  appointment, so there is nothing left to collect before calling the tool. Write whatever
+  you understood so far into the tool's `reason` field, even if it's incomplete -- staff can
+  always ask for more detail when they call back. Getting the callback logged immediately
+  matters more than gathering every detail first.
 - A question about another service: answer it the same as any other conversation, from what
   you already know Twin Wireless offers.
-- Never re-ask for their name or phone number -- both are already on file from the
-  appointment.
+- Never ask for their name or phone number -- both are already on file from the appointment.
 """
 
 
