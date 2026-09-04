@@ -47,7 +47,15 @@ PUBLIC_BASE_URL = "https://twin-wireless-phone-agent.onrender.com"
 AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static_audio")
 GREETING_AUDIO_FILES = {
     ("open", None): "greeting-open.wav",
+    # All 4 closed-hours next_open_text variants shop_open_status() can
+    # produce -- missing any one of these is exactly how the first live test
+    # of this diagnostic silently fell back to live <Say> and re-tested the
+    # wrong thing (the shop's closed-message text depends on the day of week
+    # and time, not just is_open).
+    ("closed", "today at 9 AM"): "greeting-closed-today-9am.wav",
     ("closed", "tomorrow at 9 AM"): "greeting-closed-tomorrow-9am.wav",
+    ("closed", "today at 11 AM"): "greeting-closed-today-11am.wav",
+    ("closed", "tomorrow at 11 AM"): "greeting-closed-tomorrow-11am.wav",
 }
 
 
