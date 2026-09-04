@@ -367,11 +367,23 @@ the AT&T diagnosis above.
   always Manual Deploy → Deploy latest commit from
   `dashboard.render.com/web/srv-da9o8tgn74is738nostg`, then confirm the
   deploys list shows the new commit hash + "Live" badge (~40–50s).
-- `git push` hangs on an invisible Windows Credential Manager prompt on this
-  machine. GitHub's inline CodeMirror editor also freezes the tab on a file
-  this size typed via simulated keystrokes. The reliable path is GitHub's
-  **Upload files** page (`.../upload/main`) with the corrected local file —
-  it silently overwrites the existing file at that path in the commit.
+- ✅ **`git push` WORKS — corrected 2026-09-04.** This document previously said
+  it hung on an invisible Windows Credential Manager prompt. That is no longer
+  true: `git fetch`, `git ls-remote` and `git push origin main` all completed
+  non-interactively (commit `3da3fcf` was pushed this way). Prefer git — it is
+  far faster than the browser upload and gives an exact, reviewable diff.
+  Use `GIT_TERMINAL_PROMPT=0` and a `timeout` so that if credentials ever do
+  go stale it fails fast instead of hanging.
+- ⚠️ **The local clone falls behind, because past deploys used the web upload
+  flow.** Local `HEAD` was `ad4625d` while `origin/main` was `c15e61b` — 5
+  commits behind. **Always `git fetch` and reset onto `origin/main` before
+  committing**, or you will push a change that silently reverts everything in
+  between. Never trust local `git log` for what is deployed; Render → Events
+  is authoritative.
+- GitHub's inline CodeMirror editor still freezes the tab on a file this size
+  typed via simulated keystrokes. If git is ever unavailable, use GitHub's
+  **Upload files** page (`.../upload/main`) with the local file — never the
+  inline editor.
 
 ## Second Twilio number — isolation test, NOT YET REPORTED ON
 
@@ -440,7 +452,27 @@ This is the fact to lead with at AT&T. It cannot be explained by anything on
 the Twilio side or the app side, and it cannot be dismissed as a bad
 destination number.
 
-## Diagnostic still live in production — decide whether to revert
+## ✅ Diagnostic REVERTED — deployed 2026-09-04 18:03 CDT
+
+Commit **`3da3fcf`**, deploy `dep-dadksnad0e5s73dbrg50`. `/voice` serves the
+live `<Say>` again; no caller hears a recording any more.
+
+Verified by polling the live endpoint, not by the dashboard's status:
+- greeting flipped `<Play>` → `<Say>` at **t+20s**
+- then **130 seconds** of continuous polling, every response `200`, every
+  greeting `<Say>` (the 2+ minute rule from the 9/4 crash incident)
+- final TwiML matches `opening_greeting()` **word for word**, so the
+  code/recording drift hazard is gone
+- follow-up agent survived the restart: `configured: true`, the one pending
+  record still future-dated with `attempts: 0` — no duplicate send
+- `/audio/greeting-open.wav` still returns 200, so the diagnostic can be
+  re-armed from the commented lines in `voice()` if AT&T asks for more proof
+
+Rollback target if ever needed: **`460ec8d`** (the deploy this replaced).
+
+The section below is kept for the record of why it was reverted.
+
+## Why the diagnostic was reverted
 
 `fb2e576` (2026-09-03) changed `/voice` from `<Say>` to `<Play>` with
 pre-recorded `.wav` greetings, purely to test whether Twilio's TTS caused the
