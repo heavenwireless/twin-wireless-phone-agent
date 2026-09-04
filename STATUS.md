@@ -1,5 +1,47 @@
 # Status — 2026-09-03
 
+## 2026-09-04 — phone number normalization, new-appointment SMS, one real incident
+
+- **Bug found via Kristy Moffett's real appointment**: none of the 5 real
+  appointments in the system have phone numbers in E.164 (`13184619641`, not
+  `+13184619641` — some are missing the country code entirely). This would
+  have silently failed every real follow-up send. Added `_normalize_phone()`
+  in `app.py`, used both when creating a `followups.php` record and when
+  actually sending. Unit-tested against the real data shapes before shipping.
+- **Real incident**: the first deploy of that fix crashed the service ~70s
+  after boot (`Handling signal: term` in Render's logs, no Python traceback,
+  no corresponding Render platform event) — rolled back immediately,
+  confirmed stable, then redeployed the same commit with 2+ minutes of close
+  monitoring; it stayed solid the second time. No repeat since. Root cause
+  never conclusively identified — most likely a one-off Render-side hiccup,
+  not a bug in the diff itself (the change was a small, dependency-free
+  regex helper).
+- **Kristy Moffett backfilled**: PATCHed her appointment (already
+  `Fulfilled` before this system existed, so it had no `fulfilledAt`) to
+  stamp the timestamp now. Confirmed the poller picked her up. Sunny Lee is
+  in the identical situation and was deliberately left alone — not asked
+  for.
+- **Callback-to-owner SMS verified working**: confirmed via Twilio's own
+  delivery log (not just app logs) that the "Follow-up callback requested"
+  text from earlier live testing actually reached +1 (773) 679-7766,
+  `status: delivered`.
+- **New: SMS the owner the instant a customer books**, not just on
+  Fulfilled. `appointments.php`'s existing `send_notification()` (which
+  already emails `help@twin-wireless.com`) now also calls a new
+  `/notify-new-appointment` webhook on the phone-agent app, authenticated
+  with a shared secret (`NOTIFY_WEBHOOK_SECRET`, both sides). Twilio
+  credentials stay in exactly one place (the phone-agent app) rather than
+  being duplicated onto the website server. Curl call from PHP uses a 5s
+  timeout so a slow/down phone-agent can never delay a customer's booking
+  confirmation. Tested end-to-end with a real appointment POST — SMS
+  delivered in under 2 seconds, test appointment deleted afterward.
+- **Bulk review-request texting (ad-hoc, from POS-pulled numbers)**: Murad
+  wants this chat/Routines-driven, not a website feature (see memory
+  `murad-adhoc-agent-tools-via-chat.md`). No new deployment for this — just
+  give Claude a list of numbers (typed or a file) in conversation and it
+  sends each one the same review-request text via the existing Twilio
+  client, any time, not only when a routine fires.
+
 ## Automated customer follow-up agent — added 2026-09-03/04
 
 Unattended agent: watches the Admin panel's appointments for the status
