@@ -373,8 +373,97 @@ the AT&T diagnosis above.
   **Upload files** page (`.../upload/main`) with the corrected local file —
   it silently overwrites the existing file at that path in the commit.
 
+## Second Twilio number — isolation test, NOT YET REPORTED ON
+
+A second Twilio number, **+1 (318) 515-1633**, was purchased and pointed at
+the same `/voice` webhook, to answer one question the AT&T diagnosis can't:
+**does the silence follow the destination number, or the forwarding trigger?**
+If no-answer/busy forwarding to 515-1633 is *also* silent, the fault is in how
+AT&T handles those triggers generally. If it's clear, the problem is somehow
+specific to the 723-9666 route, which would be new information.
+
+The test: set `*61*3185151633#` (no-answer) and `*67*3185151633#`
+(busy/rejected), then call and let it ring through.
+
+**Configuration VERIFIED in the Twilio console, 2026-09-04:**
+- Friendly name: "Twin Wireless - AT&T forwarding isolation test"
+- **Voice: enabled**, pointed at `https://twin-wireless-phone-agent.onrender.com/voice`
+- Messaging: **disabled — "Complete A2P registration"** (irrelevant to this
+  voice test, but it means the number cannot send/receive SMS as-is)
+- The account holds exactly **2 numbers** — 723-9666 and 515-1633. No stray
+  third number is being billed. Do not buy another.
+
+**Calls to 515-1633 have already happened (2026-09-04, CDT):**
+
+| Time | From | Duration | Call SID |
+|---|---|---|---|
+| 10:53:07 | +1 318 423-4898 | **20 sec** | `CA40c0f0cda8e6fcae6df4fb47296e69b3` |
+| 11:07:02 | +1 502 334-7406 | 44 sec | `CAae1d38a930a520500c49480fccf2c0bc` |
+| 12:03:55 | +1 318 423-4898 | 4 sec | `CAe8ae1cde31b87deb97eeb2d3d1b432e0` |
+
+The 10:53 call is **20 seconds — the exact signature of the documented
+failure** (full script length, caller hears nothing). `/voice` returned
+**200 in 272 ms**, so the app side behaved perfectly, as always.
+
+## ✅ ISOLATION TEST RESULT — confirmed by Murad, 2026-09-04
+
+**The calls to 515-1633 were FORWARDED, and they were SILENT.** Same ~20s of
+nothing, then the call ends — identical to 723-9666.
+
+**This is the strongest evidence produced so far.** The full matrix:
+
+| AT&T forwarding trigger | → 723-9666 | → 515-1633 |
+|---|---|---|
+| Unreachable (phone off/airplane) | ✅ audio works | — |
+| **No-answer (CFNRy)** | ❌ silent ~20s | ❌ **silent ~20s** |
+| **Busy / rejected (CFB)** | ❌ silent ~20s | ❌ **silent ~20s** |
+
+Changing the destination number changed **nothing**. That conclusively rules
+out, as causes:
+- the destination number itself (two independent numbers, same failure),
+- that number's Twilio configuration (different number, different config),
+- any per-number carrier routing or translation.
+
+Meanwhile **unreachable forwarding — same AT&T subscriber, same carrier, same
+destination — carries audio perfectly.** So AT&T's network *is* capable of
+delivering a working media path to this destination; it only fails to do so on
+the no-answer and busy triggers.
+
+**Conclusion: the fault is in AT&T's provisioning of the CFNRy (no-answer) and
+CFB (busy) forwarding triggers specifically — the signalling path completes
+(the call connects, Twilio answers, the TwiML runs to completion) but the
+RTP/media path is not established.** CFNRc (unreachable) is provisioned
+correctly on the same line and proves the difference is trigger-specific, not
+destination-specific.
+
+This is the fact to lead with at AT&T. It cannot be explained by anything on
+the Twilio side or the app side, and it cannot be dismissed as a bad
+destination number.
+
+## Diagnostic still live in production — decide whether to revert
+
+`fb2e576` (2026-09-03) changed `/voice` from `<Say>` to `<Play>` with
+pre-recorded `.wav` greetings, purely to test whether Twilio's TTS caused the
+AT&T silence. **It didn't** — the recording failed identically. The change was
+never reverted, and every deploy since sits on top of it, so **every caller is
+currently hearing a recording.**
+
+It works (verified 2026-09-04: `/audio/greeting-open.wav` → 200, `audio/x-wav`)
+and falls back to `<Say>` for any unrecorded variant. But it carries a silent
+hazard: **nothing ties the `.wav` files to `opening_greeting()`'s text.** Edit
+the hours or the greeting and Mia keeps speaking the old recording while every
+code-level check still passes. The two match today, but `app.py` was last
+edited 2h14m after the newest `.wav` was cut.
+
+Either revert to `<Say>` now that the diagnostic has served its purpose, or
+keep it and add a check that the recordings match the text. Needs Murad's call
+— it's a deploy to the live phone line.
+
 ## Picking this back up
 
+0. **Read the two sections directly above first** — the second number and the
+   live `<Play>` diagnostic are both open items that this document previously
+   failed to mention at all.
 1. If Murad has called AT&T since this was written: ask what they said, don't
    re-diagnose from scratch — the app/Render/Twilio-config side is already
    fully cleared.

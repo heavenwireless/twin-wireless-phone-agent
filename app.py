@@ -52,6 +52,10 @@ REVIEW_LINK = "https://g.page/r/CdNI_z0bef6qEBM/review"
 # question is answered either way.
 PUBLIC_BASE_URL = "https://twin-wireless-phone-agent.onrender.com"
 AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static_audio")
+# INACTIVE as of 2026-09-04 -- /voice serves the live <Say> again. Kept so the
+# AT&T silent-audio diagnostic can be re-armed quickly; see the comment in
+# voice() for exactly what to restore. Nothing reads this dict while /voice
+# uses <Say>.
 GREETING_AUDIO_FILES = {
     ("open", None): "greeting-open.wav",
     # All 4 closed-hours next_open_text variants shop_open_status() can
@@ -903,16 +907,21 @@ def voice():
     language = DEFAULT_LANGUAGE
     vr = VoiceResponse()
     gather = build_gather(language)
-    # See the PUBLIC_BASE_URL/GREETING_AUDIO_FILES block above -- diagnostic
-    # for the AT&T no-answer/busy silent-audio bug. Falls back to the normal
-    # live <Say> for any greeting text that doesn't have a matching
-    # pre-recorded file (e.g. a closed-hours variant not yet recorded).
-    audio_key = ("open", None) if is_open else ("closed", next_open)
-    audio_file = GREETING_AUDIO_FILES.get(audio_key)
-    if audio_file:
-        gather.play(f"{PUBLIC_BASE_URL}/audio/{audio_file}")
-    else:
-        gather.say(spoken, voice=LANGUAGES[language]["voice"])
+    # Reverted 2026-09-04 to the live <Say>. The pre-recorded <Play> greeting
+    # (fb2e576) was a diagnostic for the AT&T no-answer/busy silent-audio bug,
+    # and it did its job: the recording was silent on exactly the same calls,
+    # which ruled out text-to-speech as the cause. Keeping it running had a
+    # real cost -- nothing tied the .wav files to opening_greeting()'s text,
+    # so editing the hours or the wording would have left Mia speaking a stale
+    # recording while every code-level check still passed.
+    # The /audio route and static_audio/ are deliberately kept, so the
+    # diagnostic can be re-armed by restoring the four lines below if AT&T
+    # asks for more evidence:
+    #     audio_file = GREETING_AUDIO_FILES.get(
+    #         ("open", None) if is_open else ("closed", next_open))
+    #     if audio_file: gather.play(f"{PUBLIC_BASE_URL}/audio/{audio_file}")
+    #     else:          gather.say(spoken, voice=LANGUAGES[language]["voice"])
+    gather.say(spoken, voice=LANGUAGES[language]["voice"])
     vr.append(gather)
     # A silent Gather (nothing recognized) does not POST to /gather -- Twilio
     # just falls through to the next verb in THIS response. Ending here would
