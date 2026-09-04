@@ -27,6 +27,13 @@ ADMIN_API_USER = os.environ.get("ADMIN_API_USER")
 ADMIN_API_PASS = os.environ.get("ADMIN_API_PASS")
 FOLLOWUP_POLL_SECONDS = 300
 
+# Shared secret the website's appointments.php sends this SMS through
+# (rather than duplicating Twilio credentials onto a second server) the
+# instant a customer books, alongside the email notification it already
+# sends. Optional/None-safe like ADMIN_API_* above -- a missing secret just
+# means this one route 401s, not that the app fails to start.
+NOTIFY_WEBHOOK_SECRET = os.environ.get("NOTIFY_WEBHOOK_SECRET")
+
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
@@ -1108,6 +1115,38 @@ def followups_status():
         "needsStaffAttention": sum(1 for r in records if r.get("staffFollowupRequired")),
         "optedOut": sum(1 for r in records if r.get("optedOut")),
     }
+
+
+@app.route("/notify-new-appointment", methods=["POST"])
+def notify_new_appointment():
+    # Called synchronously by appointments.php right after it creates a new
+    # appointment, alongside the email it already sends -- so Murad hears
+    # about a new booking within seconds, not on the next 5-minute poll.
+    if not NOTIFY_WEBHOOK_SECRET or request.headers.get("X-Webhook-Secret") != NOTIFY_WEBHOOK_SECRET:
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(silent=True) or {}
+    name = " ".join(filter(None, [data.get("firstName"), data.get("lastName")])).strip() or "Customer"
+    phone = data.get("phone", "")
+    date = data.get("date", "")
+    time_ = data.get("time", "")
+    repairs = data.get("repairs") or []
+    repair_summary = ", ".join(
+        r.get("repair", "") for r in repairs if isinstance(r, dict) and r.get("repair")
+    ) or "Repair"
+
+    body = (
+        "New appointment booked:\n"
+        f"{name} -- {phone}\n"
+        f"{date} at {time_}\n"
+        f"{repair_summary}"
+    )
+    try:
+        twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body[:1500])
+        return {"ok": True}
+    except Exception as exc:
+        print(f"notify_new_appointment failed: {exc}")
+        return {"ok": False, "error": str(exc)}, 502
 
 
 # Single gunicorn worker (see README's Start command: `gunicorn app:app`, no
