@@ -4,7 +4,7 @@ import re
 import requests
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_from_directory
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
@@ -33,6 +33,27 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 MODEL = "claude-haiku-4-5-20251001"
 
 REVIEW_LINK = "https://g.page/r/CdNI_z0bef6qEBM/review"
+
+# --- Diagnostic: pre-recorded opening greeting -----------------------------
+# Test for the AT&T conditional-forwarding silent-audio bug: does a PLAYed
+# static audio file survive the broken no-answer/busy forwarding leg where
+# live-generated <Say> TTS does not? Only the opening line changes -- every
+# later Mia reply is still real, dynamic <Say> TTS (it has to be, it's a
+# unique response to whatever the caller just said), so this can prove or
+# rule out "it's specifically live TTS audio" but can't be a full fix on its
+# own. See STATUS.md. Remove this block (and revert /voice) once the AT&T
+# question is answered either way.
+PUBLIC_BASE_URL = "https://twin-wireless-phone-agent.onrender.com"
+AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static_audio")
+GREETING_AUDIO_FILES = {
+    ("open", None): "greeting-open.wav",
+    ("closed", "tomorrow at 9 AM"): "greeting-closed-tomorrow-9am.wav",
+}
+
+
+@app.route("/audio/<path:filename>", methods=["GET"])
+def audio(filename):
+    return send_from_directory(AUDIO_DIR, filename)
 
 FINANCING_LINKS = {
     "acima": (
@@ -850,7 +871,16 @@ def voice():
     language = DEFAULT_LANGUAGE
     vr = VoiceResponse()
     gather = build_gather(language)
-    gather.say(spoken, voice=LANGUAGES[language]["voice"])
+    # See the PUBLIC_BASE_URL/GREETING_AUDIO_FILES block above -- diagnostic
+    # for the AT&T no-answer/busy silent-audio bug. Falls back to the normal
+    # live <Say> for any greeting text that doesn't have a matching
+    # pre-recorded file (e.g. a closed-hours variant not yet recorded).
+    audio_key = ("open", None) if is_open else ("closed", next_open)
+    audio_file = GREETING_AUDIO_FILES.get(audio_key)
+    if audio_file:
+        gather.play(f"{PUBLIC_BASE_URL}/audio/{audio_file}")
+    else:
+        gather.say(spoken, voice=LANGUAGES[language]["voice"])
     vr.append(gather)
     # A silent Gather (nothing recognized) does not POST to /gather -- Twilio
     # just falls through to the next verb in THIS response. Ending here would
