@@ -701,10 +701,23 @@ def _build_followup_message(appointment, settings):
     return " ".join(parts)[:1400]
 
 
+def _normalize_phone(phone):
+    """Appointment phone numbers come from the booking form as plain digits
+    (e.g. "13184619641" or "3184695955"), never E.164 -- none of the real
+    appointments in the system have a "+" on the number. Twilio requires
+    E.164 to send. Assumes US/+1 (matches the shop's whole customer base)."""
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return None
+
+
 def _send_followup_sms(appointment, settings):
-    phone = appointment.get("phone", "")
-    if not phone.startswith("+"):
-        return False, "appointment has no usable phone number"
+    phone = _normalize_phone(appointment.get("phone", ""))
+    if not phone:
+        return False, f"appointment has no usable phone number: {appointment.get('phone')!r}"
     body = _build_followup_message(appointment, settings)
     try:
         twilio_client.messages.create(to=phone, from_=TWILIO_FROM_NUMBER, body=body)
@@ -741,7 +754,11 @@ def run_followup_cycle():
                 "/admin-api/followups.php",
                 {
                     "appointmentId": appointment["id"],
-                    "phone": appointment.get("phone", ""),
+                    # Normalized here (not just at send time) so the stored
+                    # phone matches the E.164 format Twilio's `From` arrives
+                    # in on a reply, which is what _followup_context() keys
+                    # its lookup on.
+                    "phone": _normalize_phone(appointment.get("phone", "")) or appointment.get("phone", ""),
                     "fulfilledAt": appointment["fulfilledAt"],
                 },
             )
