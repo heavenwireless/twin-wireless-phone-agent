@@ -601,8 +601,12 @@ def _admin_api_patch(path, payload, auth=True):
 
 
 def get_followup_settings():
+    # /admin-api/site-settings.php requires auth for every method (unlike
+    # the public mirror at /api/site-settings.php), so this must NOT pass
+    # auth=False -- a live test caught this returning a silent 401 and
+    # falling back to defaults instead of the real configured delay.
     try:
-        data = _admin_api_get("/admin-api/site-settings.php", auth=False)
+        data = _admin_api_get("/admin-api/site-settings.php")
     except Exception as exc:
         print(f"Follow-up agent: could not read site-settings, using defaults: {exc}")
         return dict(FOLLOWUP_DEFAULT_SETTINGS)
@@ -615,8 +619,11 @@ def _service_recommendation(appointment):
     # Pulled live from the real catalog every time -- never a hardcoded
     # list, so this can never recommend a service Twin Wireless doesn't
     # actually currently offer (or has taken down).
+    # /api/catalog.php is also Basic-Auth-protected (part of the "Private
+    # Shop Phase 2C" restriction), so this needs auth=True too -- same bug
+    # shape as get_followup_settings() above, caught by the same live test.
     try:
-        catalog = _admin_api_get("/api/catalog.php", auth=False).get("items", [])
+        catalog = _admin_api_get("/api/catalog.php").get("items", [])
     except Exception as exc:
         print(f"Follow-up agent: could not read catalog for recommendation: {exc}")
         return None
