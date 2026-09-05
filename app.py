@@ -579,6 +579,19 @@ def send_financing_link_sms(args, caller_number):
 def send_review_link_sms(caller_number):
     if not caller_number or not caller_number.startswith("+"):
         return
+    # Added 2026-09-05. This sends the SAME REVIEW_LINK the automated follow-up
+    # uses, so to a customer who unsubscribed it reads as the shop ignoring
+    # their STOP and resuming review solicitation. Previously nothing on this
+    # path consulted optedOut -- the only opt-out gate in the app was the
+    # per-record check inside run_followup_cycle.
+    # Deliberately NOT applied to plain conversational replies or to a
+    # financing link the customer just asked for: the unsubscribe confirmation
+    # explicitly scopes the opt-out to follow-up texts and invites them to text
+    # again. A review request is exactly what they opted out of; an answer to
+    # their own question is not.
+    if _is_opted_out(caller_number):
+        print(f"send_review_link_sms: skipped, number opted out ({caller_number[-4:]})")
+        return
     body = f"Thanks for calling Twin Wireless! Mind leaving us a quick review? {REVIEW_LINK}"
     try:
         twilio_client.messages.create(to=caller_number, from_=TWILIO_FROM_NUMBER, body=body)
@@ -646,6 +659,113 @@ def _admin_api_post(path, payload, auth=True):
 
 def _admin_api_patch(path, payload, auth=True):
     return _admin_api_request("PATCH", path, json_body=payload, auth=auth)
+
+
+# ---------------------------------------------------------------------------
+# Opt-out, keyed on the PHONE NUMBER rather than one appointment.
+#
+# Before 2026-09-05 an opt-out lived only on the single follow-up record the
+# customer happened to reply to. Two real holes came out of that, both audited
+# in code:
+#   1. A customer who opted out and later booked a NEW repair got a fresh
+#      record with optedOut=false and was texted again.
+#   2. STOP was only honoured inside an already-SENT follow-up thread, because
+#      the whole opt-out block sat under `if followup_record:` and
+#      _followup_context() returns only records with followUpStatus == "sent".
+#      A pre-emptive STOP, or a STOP from someone who had only ever been sent a
+#      review or financing link, was never recorded at all -- it fell through
+#      to Claude and got a chatty reply instead of an unsubscribe.
+#
+# Opt-out is a property of the PERSON. These helpers treat it that way.
+# ---------------------------------------------------------------------------
+
+def _optout_appointment_id(phone):
+    """Deterministic synthetic id, so a number with no real appointment still
+    has somewhere to store its opt-out -- and so repeat STOPs are idempotent
+    (followups.php's POST returns the existing record for a known id).
+    Digits only, and well inside the server's 40-char clean_text() limit."""
+    digits = re.sub(r"\D", "", phone or "")
+    return f"optout-{digits}"
+
+
+def _records_for_phone(phone):
+    """Every follow-up record for this number. Raises on API failure so callers
+    can decide explicitly whether to fail open or closed."""
+    return _admin_api_get("/admin-api/followups.php", params={"phone": phone}).get("followups", [])
+
+
+def _is_opted_out(phone):
+    """True if ANY record for this number is opted out.
+
+    FAILS CLOSED: if the admin API can't be reached we cannot prove the number
+    is safe to contact, so we report opted-out and skip the send. Silently not
+    sending a marketing text is recoverable; texting someone who said STOP is
+    not."""
+    normalized = _normalize_phone(phone) or phone
+    if not (ADMIN_API_USER and ADMIN_API_PASS) or not normalized:
+        return False
+    try:
+        return any(r.get("optedOut") for r in _records_for_phone(normalized))
+    except Exception as exc:
+        print(f"_is_opted_out: could not verify {normalized}, failing closed: {exc}")
+        return True
+
+
+def _record_opt_out(phone, body):
+    """Mark EVERY record for this number opted out, creating a placeholder if
+    the number has none. Returns True if the opt-out was persisted somewhere.
+
+    Persisting matters more than the reply: the confirmation text below is
+    cheap, but an unrecorded opt-out means the next automated cycle texts them
+    again."""
+    normalized = _normalize_phone(phone) or phone
+    if not (ADMIN_API_USER and ADMIN_API_PASS) or not normalized:
+        return False
+
+    try:
+        records = _records_for_phone(normalized)
+    except Exception as exc:
+        print(f"_record_opt_out: could not fetch records for {normalized}: {exc}")
+        records = []
+
+    if not records:
+        # No appointment ever tied to this number (e.g. they only got a review
+        # link after a call). Create a placeholder purely to hold the opt-out.
+        # run_followup_cycle skips it twice over -- optedOut is true, and no
+        # appointment matches the synthetic id -- and the admin dashboard
+        # renders it under "Opted Out", never under "Pending".
+        try:
+            _admin_api_post(
+                "/admin-api/followups.php",
+                {
+                    "appointmentId": _optout_appointment_id(normalized),
+                    "phone": normalized,
+                    "fulfilledAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+            )
+            records = [{"appointmentId": _optout_appointment_id(normalized)}]
+        except Exception as exc:
+            print(f"_record_opt_out: could not create placeholder for {normalized}: {exc}")
+            return False
+
+    persisted = False
+    for record in records:
+        appointment_id = record.get("appointmentId")
+        if not appointment_id:
+            continue
+        try:
+            _admin_api_patch(
+                "/admin-api/followups.php",
+                {
+                    "appointmentId": appointment_id,
+                    "optedOut": True,
+                    "customerResponse": (body or "")[:500],
+                },
+            )
+            persisted = True
+        except Exception as exc:
+            print(f"_record_opt_out: PATCH failed for {appointment_id}: {exc}")
+    return persisted
 
 
 def get_followup_settings():
@@ -789,8 +909,29 @@ def run_followup_cycle():
     end_hour = settings.get("sendingHoursEnd", 20)
     max_retries = settings.get("maxRetries", 3)
 
+    # Opt-out follows the PERSON, not the appointment. Built from `records`,
+    # which is already in hand -- no extra request, and no fail-open/closed
+    # question, because a failure to fetch already returned above.
+    # Without this, a customer who opted out and then booked another repair got
+    # a brand-new record with optedOut=false and was texted again.
+    opted_out_phones = {
+        _normalize_phone(r.get("phone")) or r.get("phone")
+        for r in records
+        if r.get("optedOut")
+    }
+    opted_out_phones.discard(None)
+    opted_out_phones.discard("")
+
     for record in records:
         if record.get("optedOut") or record.get("followUpStatus") in ("sent", "failed"):
+            continue
+
+        record_phone = _normalize_phone(record.get("phone")) or record.get("phone")
+        if record_phone in opted_out_phones:
+            print(
+                "Follow-up cycle: skipping appointment "
+                f"{record.get('appointmentId')} -- this number opted out on another record"
+            )
             continue
 
         appointment = appointment_by_id.get(str(record.get("appointmentId")))
@@ -1006,29 +1147,30 @@ def sms():
     if not body:
         return Response(str(resp), mimetype="text/xml")
 
+    # STOP is checked FIRST, on EVERY inbound text, before we know anything
+    # about follow-up threads. It used to live under `if followup_record:`,
+    # and _followup_context() only returns records already in status "sent" --
+    # so a STOP sent pre-emptively, or by someone who had only ever received a
+    # review or financing link from Mia, was never recorded at all and fell
+    # through to Claude as ordinary chat. The customer got a chatty reply
+    # instead of an unsubscribe, and the next automated cycle texted them.
+    # Keyword-based and independent of Claude on purpose: an opt-out must never
+    # be missed because a reply was ambiguous.
+    lowered = re.sub(r"[^a-z ]", "", body.lower()).strip()
+    if lowered in OPT_OUT_KEYWORDS:
+        if not _record_opt_out(from_number, body):
+            # Confirming an opt-out we failed to persist would be a lie -- the
+            # next cycle would text them anyway. Say so loudly; a human can
+            # still honour it from the log.
+            print(f"OPT-OUT NOT PERSISTED for {from_number[-4:]} -- needs manual action")
+        resp.message("You're unsubscribed from Twin Wireless follow-up texts. Text us any time if you need us again.")
+        return Response(str(resp), mimetype="text/xml")
+
     # A reply to an automated post-repair follow-up text is handled
     # differently from a fresh customer message -- see FOLLOWUP_REPLY_NOTE
     # and run_followup_cycle() above. followup_record is None for any
     # ordinary call/text, so none of this changes existing behavior.
     followup_record = _followup_context(from_number)
-    if followup_record:
-        lowered = re.sub(r"[^a-z ]", "", body.lower()).strip()
-        if lowered in OPT_OUT_KEYWORDS:
-            try:
-                _admin_api_patch(
-                    "/admin-api/followups.php",
-                    {
-                        "appointmentId": followup_record["appointmentId"],
-                        "optedOut": True,
-                        "customerResponse": body[:500],
-                    },
-                )
-            except Exception as exc:
-                print(f"opt-out record failed: {exc}")
-            # Unconditional and independent of Claude on purpose -- an
-            # opt-out must never be missed because a reply was ambiguous.
-            resp.message("You're unsubscribed from Twin Wireless follow-up texts. Text us any time if you need us again.")
-            return Response(str(resp), mimetype="text/xml")
 
     session_key = f"sms:{from_number}"
     session = sessions.setdefault(session_key, {"history": [], "language": DEFAULT_LANGUAGE})
