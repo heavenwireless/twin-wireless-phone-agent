@@ -1,5 +1,59 @@
 # Status — 2026-09-03
 
+## 2026-09-05 — opt-out now follows the customer, not one appointment
+
+Commit `7424b68`, deploy live 15:47 UTC. Three defects, all found by auditing
+the customer-service safety gates against the code rather than trusting the
+docs, and each one let a customer who said STOP keep hearing from the shop.
+
+1. **Opt-out was stored per follow-up RECORD.** The only gate on an automated
+   send was `run_followup_cycle`'s per-record check (`app.py:793`), so a
+   customer who opted out and then booked a **new repair** got a fresh record
+   with `optedOut: false` and was texted again. The cycle now builds the set of
+   opted-out numbers from the records it has already fetched — no extra request
+   — and skips any record whose phone appears opted out anywhere.
+2. **STOP was only honoured inside an already-SENT follow-up thread.** The
+   whole opt-out block sat under `if followup_record:`, and `_followup_context`
+   returns only records with `followUpStatus == "sent"`. A STOP sent
+   pre-emptively, or by someone who had only ever received a review or
+   financing link, was **never recorded** — it fell through to Claude and got a
+   chatty reply instead of an unsubscribe, and the next cycle texted them. The
+   keyword check now runs **first on every inbound text**, before any follow-up
+   lookup, and `_record_opt_out()` marks every record for that number, creating
+   a placeholder (`optout-<digits>`, idempotent) if the number has none.
+3. **`send_review_link_sms` never checked `optedOut`.** It sends the same
+   `REVIEW_LINK` the automated follow-up uses. It now checks and **fails
+   closed** — if the admin API is unreachable we cannot prove the number is
+   safe, so we skip.
+
+Deliberately unchanged: plain conversational replies, and a financing link the
+customer just asked for. The unsubscribe text scopes the opt-out to follow-up
+texts and invites them to text again.
+
+### Verified live
+- Deploy flipped at **t+40s**, then **130 s** of continuous polling, all 200.
+- Fix 2 proved end to end by POSTing `STOP` to `/sms` from Twilio's synthetic
+  `+15005550006` (a direct webhook POST — **no real SMS is sent this way**).
+  Old code fell through to Claude; new code returned the unsubscribe
+  confirmation **and persisted the opt-out** for a number with no prior record.
+  ~18 repeat POSTs produced exactly **one** record, confirming the
+  deterministic id makes repeats idempotent.
+- Two full poller cycles (15:51:55, 15:56:55, exactly 5 min apart) ran the new
+  code without error. The real customer record was untouched throughout.
+- Test record removed afterwards; store back to 1 real record. Backup at
+  `data/followups.json.bak-pretestcleanup-2026-09-05` (outside the doc root,
+  verified 403).
+
+### ⚠️ Process note — a false alarm worth not repeating
+Mid-verification I concluded the poller had died and came close to rolling back
+a healthy deploy. Two compounding mistakes: the nested-SSH quoting in the watch
+loop mangled its `awk`, so the counter returned `0` from broken input rather
+than from absent data; and the cutoff `15:47:00` sat one second **after** the
+boot-time cycle at 15:46:56, so a normal 5-minute gap read as a failure.
+**A monitoring command must be proven able to detect the thing it is looking
+for before its zero is believed** — the same lesson as the earlier access-log
+glob that silently expanded to nothing under `sudo`.
+
 ## 2026-09-04 — phone number normalization, new-appointment SMS, one real incident
 
 - **Bug found via Kristy Moffett's real appointment**: none of the 5 real
