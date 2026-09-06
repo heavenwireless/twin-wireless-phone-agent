@@ -1,5 +1,41 @@
 # Status — 2026-09-03
 
+## 2026-09-05 (late) — repair scope and back-glass prices corrected; the DOCS were wrong
+
+Commit `0ba0cfa`, deployed and verified. Two audits this week flagged the live
+website as publishing wrong information. **Murad confirmed the website was
+RIGHT both times** and this app's prompt was the stale surface.
+
+1. **Smartwatches ARE repaired** (Apple Watch, Galaxy Watch, Pixel Watch).
+   The prompt said four categories "ONLY" and told Mia not to even take a
+   message for anything else — so a customer who booked a watch repair on the
+   website and then phoned was refused and got no callback.
+2. **iPhone 8 / 8 Plus DO have glass backs, $100 plus tax is real.** The prompt
+   claimed they "don't have a glass back", contradicting the site's published
+   $100. Both models added to the $100 tier; the exclusion narrowed to 7/7 Plus.
+
+Prompt text only — no logic, tools or routes touched.
+
+### Verified by output, not by the dashboard
+Polled `/sms` with the two questions she previously got wrong (direct webhook
+POSTs from synthetic numbers — no SMS reached anyone):
+- Answer flipped between t+30s and t+45s: "Apple Watches aren't something we
+  repair" -> "We do work on Apple Watches, including screen repairs!"
+- **12 consecutive correct answers over 3 minutes**, health 200 throughout.
+- iPhone 8 back glass: **"$100 plus tax"** on all three asks, "plus tax" every time.
+- Smartwatch pricing correctly refused as case-by-case with a free diagnosis —
+  no invented number.
+- **Control case held:** iPhone 7 still answers "doesn't have a glass back, so
+  back glass replacement doesn't apply." The narrowing did not over-correct.
+
+### The lesson worth keeping
+The knowledge base is a description written once and not maintained.
+`api/quotes.php` is admin-editable and tracks what the shop actually does,
+changing with **no deploy and no diff to review**. When a documented fact and a
+live customer-facing surface disagree, **the live surface is not automatically
+the error — ask.** Acting on either "fix" unilaterally would have deleted a
+real service and a real price from the website.
+
 ## 2026-09-05 — opt-out now follows the customer, not one appointment
 
 Commit `7424b68`, deploy live 15:47 UTC. Three defects, all found by auditing
