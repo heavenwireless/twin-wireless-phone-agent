@@ -340,6 +340,38 @@ diffed the very first uploaded commit (`5db979d`, Aug 31) against the latest —
 time. The app-side behavior for a *normal* call never regressed; only the
 retry/timing/latency issues above were real, and all three are fixed.
 
+## ⚡ REFINED 2026-09-07 — the cause is located: codec negotiation fails
+
+Murad pushed back on the "AT&T's network, script ran fine" conclusion — rightly:
+script execution proves TwiML ran, not that audio left Twilio's edge, and one
+working trigger does not clear Twilio for the other two. The missing evidence
+was pulled from Twilio Voice Insights Carrier Edge metrics (console, logged-in
+session, 2026-09-07):
+
+| Metric | Working call (CAa6a7c46ac87ace1e48aadd89a416ebf5, direct, 3min) | Silent forwarded (CA40c0f0cda8e6fcae6df4fb47296e69b3) |
+|---|---|---|
+| Codec | **pcmu** | **"-" — none negotiated** |
+| Jitter | none | detected, 157.4/120.5 ms max/avg |
+| Edge | Ashburn (us1) | Ashburn (us1) |
+
+**With no codec agreed, no audio can flow in either direction** — exactly the
+symptom. The failure is SDP/codec negotiation on the forwarded legs, at media
+setup. LOCATED, not yet ATTRIBUTED: the metrics show the negotiation result,
+not the raw SDP offer/answer, so which side sent the unusable offer is the one
+open question. Only Twilio support can pull the SDP.
+
+Also new: silent forwarded calls carry **STIR/SHAKEN attestation C** (lowest).
+
+App-side trigger-dependence was re-checked and excluded: /voice never reads
+ForwardedFrom/CalledVia; identical TwiML for every call type. No app or Twilio
+account setting controls inbound PSTN codec negotiation, so no local fix
+exists at this layer.
+
+**Next step (approved by Murad 2026-09-07):** Twilio support ticket asking for
+the SDP offer/answer on the three silent SIDs vs the working reference —
+evidence packet prepared with SIDs, timestamps and the request text. Murad
+files it; then AT&T gets the SDP evidence if it shows a carrier-side offer.
+
 ## The still-open problem: audio is silent on forwarded calls specifically
 
 **A direct call to (318) 723-9666 is completely clear** (confirmed by Murad).
