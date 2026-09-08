@@ -1439,11 +1439,15 @@ def send_pos_review():
     #
     # This endpoint deliberately owns the last line of defence regardless of
     # what the caller decides:
-    #   - same shared-secret header as /notify-new-appointment
+    #   - shared-secret header: its own POS_REVIEW_SECRET (minted for the shop
+    #     machine's routine), with NOTIFY_WEBHOOK_SECRET also accepted so the
+    #     website server could use it too
     #   - the STOP list is checked here, not trusted to the caller
     #   - numbers the website flow already texted are skipped, so a customer
     #     who booked online AND is in the POS never hears from us twice
-    if not NOTIFY_WEBHOOK_SECRET or request.headers.get("X-Webhook-Secret") != NOTIFY_WEBHOOK_SECRET:
+    given = request.headers.get("X-Webhook-Secret", "")
+    accepted = {s for s in (os.environ.get("POS_REVIEW_SECRET", ""), NOTIFY_WEBHOOK_SECRET) if s}
+    if not accepted or given not in accepted:
         return {"error": "unauthorized"}, 401
 
     data = request.get_json(silent=True) or {}
