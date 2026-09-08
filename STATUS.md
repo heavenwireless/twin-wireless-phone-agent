@@ -1,10 +1,41 @@
 # Status — 2026-09-03
 
-## ⚠️ 2026-09-08 — TWO SECURITY FIXES COMMITTED BUT **NOT DEPLOYED**
+## 2026-09-08 — TWO SECURITY FIXES **DEPLOYED**, running in LOG MODE
 
-**The repo is AHEAD of production.** Commit `48aca33` is pushed to GitHub;
-Render auto-deploy is OFF for `srv-da9o8tgn74is738nostg`, so the running
-service is still `01b0d5b`. Nothing below is live yet.
+**Deployed 10:41:42 CDT**, deploy `dep-dag2pdm7bikc73ct0cig`, source `0b50909`,
+"Deploy succeeded", gunicorn booted clean, service healthy across 4 consecutive
+external health checks. Now in the **bake period** — see below.
+
+Two corrections to what this file previously assumed:
+
+- **The pre-deploy live commit was `0ba0cfa` (Sep 5), not `01b0d5b`.** Render's
+  banner read *"Auto-Deploy has been disabled to prevent accidental deploys.
+  This service was rolled back to a previous deploy."* **`0ba0cfa` is therefore
+  the rollback target**, not `01b0d5b`. This is exactly the repo-vs-GitHub-vs-
+  deployed drift the audit warned about; do not trust a STATUS.md claim about
+  deployed state without reading Render.
+- `01b0d5b` and `0b50909` only ever touched this file, so the sole behavioural
+  change in this deploy is `48aca33`.
+
+**Verified running:** an unsigned `POST /voice` produced
+`TWILIO-SIG WOULD-REJECT path=/voice from=… (log mode, allowed through)` at
+10:43:41. That single line proves the decorator is deployed, that it correctly
+rejects an unsigned request, and that log mode does not drop traffic.
+
+### Still to do — the bake period
+
+`TWILIO_VALIDATE` is at its default `log`. **A real Twilio request has not yet
+been observed.** Before enforcing:
+
+1. Place a genuine call or text to **(318) 723-9666** — Mia's number directly,
+   NOT the published (318) 670-3938, which still has the carrier
+   silent-forwarding fault.
+2. Search Render logs for `TWILIO-SIG`. Expect `ok path=/sms` or `ok path=/voice`.
+3. **Only if `ok` appears for real traffic:** add env var
+   `TWILIO_VALIDATE=enforce` and redeploy. Invalid signatures then get 403.
+4. If real traffic instead shows `WOULD-REJECT`, do NOT enforce — the URL
+   scheme or proxy headers need adjusting first. Log mode exists precisely so
+   this is discovered without dropping a customer's call.
 
 Both fixes come from the 2026-09-08 read-only audit:
 
