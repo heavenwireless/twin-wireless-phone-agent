@@ -1428,6 +1428,63 @@ def notify_new_appointment():
         return {"ok": False, "error": str(exc)}, 502
 
 
+@app.route("/send-pos-review", methods=["POST"])
+def send_pos_review():
+    # Review request for a repair tracked in the CellPoint Pro POS -- Murad's
+    # 2026-09-08 directive. The website follow-up agent above only ever sees
+    # website bookings; walk-in repairs live in the POS and never got asked.
+    # A routine on the shop machine reads the POS export, decides WHO is due
+    # (its own ledger enforces one-text-per-repair), and calls this to do the
+    # actual send from Mia's number.
+    #
+    # This endpoint deliberately owns the last line of defence regardless of
+    # what the caller decides:
+    #   - same shared-secret header as /notify-new-appointment
+    #   - the STOP list is checked here, not trusted to the caller
+    #   - numbers the website flow already texted are skipped, so a customer
+    #     who booked online AND is in the POS never hears from us twice
+    if not NOTIFY_WEBHOOK_SECRET or request.headers.get("X-Webhook-Secret") != NOTIFY_WEBHOOK_SECRET:
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(silent=True) or {}
+    phone = _normalize_phone(data.get("phone", ""))
+    if not phone:
+        return {"ok": False, "skipped": "bad-phone", "given": str(data.get("phone"))[:20]}, 400
+    first_name = ((data.get("name") or "").strip().split(" ") or ["there"])[0] or "there"
+    device = (data.get("device") or "").strip()
+
+    if _is_opted_out(phone):
+        return {"ok": False, "skipped": "opted-out"}
+
+    # Dedupe against the website follow-up ledger. Fail-open on a read error:
+    # the caller's ledger already prevents re-sends of ITS records, and
+    # blocking every POS review because the website API hiccuped is the worse
+    # failure. The overlap window this protects is small and known.
+    try:
+        records = _admin_api_get("/admin-api/followups.php").get("followups", [])
+        tail = phone[-10:]
+        for r in records:
+            rp = _normalize_phone(r.get("phone", "")) or ""
+            if rp and rp[-10:] == tail and r.get("followUpStatus") == "sent":
+                return {"ok": False, "skipped": "already-followed-up-website"}
+    except Exception as exc:
+        print(f"send_pos_review: followups dedupe unavailable, proceeding: {exc}")
+
+    what = f"your {device}" if device else "your device"
+    body = (
+        f"Hi {first_name}! This is Twin Wireless. We wanted to check in and make sure "
+        f"everything is working great with {what} after your repair. We really "
+        "appreciate your business! If you had a great experience, we'd really "
+        f"appreciate an honest Google review: {REVIEW_LINK}"
+    )
+    try:
+        msg = twilio_client.messages.create(to=phone, from_=TWILIO_FROM_NUMBER, body=body)
+        return {"ok": True, "sid": msg.sid, "phone_tail": phone[-4:]}
+    except Exception as exc:
+        print(f"send_pos_review failed for ...{phone[-4:]}: {exc}")
+        return {"ok": False, "error": str(exc)}, 502
+
+
 # Single gunicorn worker (see README's Start command: `gunicorn app:app`, no
 # --workers flag), so this runs exactly once per deploy, not once per
 # worker. A failure here must never take the whole app down with it --
