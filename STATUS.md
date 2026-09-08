@@ -1,5 +1,50 @@
 # Status — 2026-09-03
 
+## ⚠️ 2026-09-08 — TWO SECURITY FIXES COMMITTED BUT **NOT DEPLOYED**
+
+**The repo is AHEAD of production.** Commit `48aca33` is pushed to GitHub;
+Render auto-deploy is OFF for `srv-da9o8tgn74is738nostg`, so the running
+service is still `01b0d5b`. Nothing below is live yet.
+
+Both fixes come from the 2026-09-08 read-only audit:
+
+1. **Twilio request-signature validation** on `/voice`, `/gather`, `/sms`.
+   These accepted any request that reached them — anyone who knew the URL could
+   drive a Claude turn and make the shop's number text a number of their
+   choosing, at Twin Wireless's expense and under its name.
+
+2. **Opt-out matching widened.** The check was an exact whole-body match, so
+   `"STOP texting me"` and `"please unsubscribe"` fell through to Claude as
+   ordinary chat: no opt-out recorded, friendly reply sent, and the next cycle
+   texted them again. Compliance exposure, not cosmetic.
+   Deliberately still conservative the other way — `"cancel"` and `"end"` need
+   an exact whole-body match, because *"cancel my appointment"* and *"end of the
+   week"* are ordinary replies and unsubscribing that customer would silently
+   kill their own follow-up and review request.
+   Verified against 17 phrasings that must opt out and 10 that must not.
+
+### Deploying this — staged on purpose
+
+`TWILIO_VALIDATE` defaults to **`log`**: it validates, prints the verdict, and
+**lets the request through**. A signature check that is subtly wrong would
+reject *every real call*, which is worse than the hole it closes — and the
+phone line cannot be test-called from here.
+
+1. Render → `twin-wireless-phone-agent` → **Manual Deploy → Deploy latest commit**.
+2. Confirm boot: `GET https://twin-wireless-phone-agent.onrender.com/` → 200.
+3. Watch Logs for a real call/text. Expect `TWILIO-SIG ok path=/voice mode=log`.
+   If you instead see `TWILIO-SIG WOULD-REJECT`, **do not enforce** — the URL
+   scheme or proxy headers need adjusting first.
+4. Only once the logs show `ok` for real traffic: add env var
+   `TWILIO_VALIDATE=enforce` and redeploy. Invalid signatures then get 403.
+
+Escape hatch: `TWILIO_VALIDATE=off` disables the check entirely, no code change.
+Rollback: redeploy `01b0d5b`.
+
+Render terminates TLS at its proxy, so Flask sees `http://` while Twilio signed
+`https://`. `X-Forwarded-Proto` is honoured and the opposite scheme is tried as
+a fallback, so a proxy change cannot silently take the line down.
+
 ## 2026-09-05 (late) — repair scope and back-glass prices corrected; the DOCS were wrong
 
 Commit `0ba0cfa`, deployed and verified. Two audits this week flagged the live
