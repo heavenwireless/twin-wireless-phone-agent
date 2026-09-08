@@ -39,6 +39,80 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 MODEL = "claude-haiku-4-5-20251001"
 
+# --- Webhook authenticity --------------------------------------------------
+# /voice, /gather and /sms accepted ANY request that reached them. Anyone who
+# knew the URL could drive a Claude turn and make the shop's own number send an
+# SMS to a number of their choosing -- real Twilio spend, sent as Twin Wireless.
+# Audit finding, 2026-09-08.
+#
+# Twilio signs every webhook with the account auth token; validating that
+# signature proves the request genuinely came from Twilio. See
+# https://www.twilio.com/docs/usage/security#validating-requests
+#
+# Two deliberate details:
+#  * Render terminates TLS at its proxy, so Flask sees http:// while Twilio
+#    signed the https:// URL. Signing the wrong scheme rejects every real call.
+#    X-Forwarded-Proto is honoured, and the alternate scheme is tried as a
+#    fallback so a proxy change cannot silently take the phone line down.
+#  * Rollout is staged. This guards the shop's live phone line, and a signature
+#    check that is subtly wrong would reject EVERY real call -- worse than the
+#    hole it closes. So the mode defaults to "log": validate, log the verdict,
+#    but let the request through. Once the logs show real Twilio traffic
+#    validating cleanly, flip TWILIO_VALIDATE to "enforce".
+#
+#    TWILIO_VALIDATE:  "log" (default) = observe only
+#                      "enforce"       = reject invalid signatures with 403
+#                      "off"           = skip entirely (emergency)
+#    Settable as a Render env var, so switching modes needs no code change.
+from functools import wraps
+from twilio.request_validator import RequestValidator
+
+_twilio_validator = RequestValidator(TWILIO_AUTH_TOKEN)
+TWILIO_VALIDATE = os.environ.get("TWILIO_VALIDATE", "log").strip().lower()
+
+
+def _signature_ok() -> bool:
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        return False
+
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    primary = request.url.replace("http://", f"{proto}://", 1)
+    params = request.form.to_dict()
+
+    if _twilio_validator.validate(primary, params, signature):
+        return True
+
+    # Fallback: try the opposite scheme rather than dropping a real caller if
+    # the proxy header ever changes shape.
+    other = primary.replace("https://", "http://", 1) if primary.startswith("https://") \
+        else primary.replace("http://", "https://", 1)
+    return _twilio_validator.validate(other, params, signature)
+
+
+def require_twilio_signature(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if TWILIO_VALIDATE == "off":
+            return view(*args, **kwargs)
+
+        ok = _signature_ok()
+        if ok:
+            # Printed so the bake period has positive evidence, not just silence.
+            print(f"TWILIO-SIG ok path={request.path} mode={TWILIO_VALIDATE}")
+            return view(*args, **kwargs)
+
+        source = request.headers.get("X-Forwarded-For", request.remote_addr)
+        if TWILIO_VALIDATE == "enforce":
+            print(f"TWILIO-SIG REJECTED path={request.path} from={source}")
+            return Response("Forbidden", status=403)
+
+        # log mode: record it, but do not drop the request.
+        print(f"TWILIO-SIG WOULD-REJECT path={request.path} from={source} (log mode, allowed through)")
+        return view(*args, **kwargs)
+
+    return wrapped
+
 REVIEW_LINK = "https://g.page/r/CdNI_z0bef6qEBM/review"
 
 # --- Diagnostic: pre-recorded opening greeting -----------------------------
@@ -642,6 +716,56 @@ FOLLOWUP_DEFAULT_SETTINGS = {
 # an opt-out is never missed because Claude interpreted the reply oddly.
 OPT_OUT_KEYWORDS = {"stop", "unsubscribe", "cancel", "quit", "end", "stopall"}
 
+# Keywords that unambiguously mean "stop texting me" when they LEAD a message.
+# Deliberately excludes "cancel" and "end" -- "cancel my appointment" and "end of
+# the week" are ordinary repair-shop replies, and unsubscribing that customer
+# would silently cut off their own follow-up and review request.
+OPT_OUT_LEADING = ("stop", "stopall", "unsubscribe", "quit")
+
+# Phrasings people actually use. Matched as substrings of the normalized body.
+OPT_OUT_PHRASES = (
+    "stop texting", "stop text", "stop sending", "stop messaging",
+    "no more text", "no more message", "dont text", "do not text",
+    "dont message", "do not message", "remove me", "take me off",
+    "opt out", "optout", "leave me alone",
+    # "unsubscribe" is safe anywhere in a message -- unlike "stop" or "cancel"
+    # it has no ordinary repair-shop meaning, so "please unsubscribe" counts.
+    "unsubscribe",
+)
+
+
+def is_opt_out(body: str) -> bool:
+    """Decide whether an inbound text is an opt-out.
+
+    Previously this was `normalized in OPT_OUT_KEYWORDS` -- an exact whole-body
+    match. That honoured a bare "STOP" but let "STOP texting me" and "please
+    unsubscribe" fall through to Claude as ordinary chat, so the customer got a
+    friendly reply, no opt-out was recorded, and the next cycle texted them
+    again. Audit finding, 2026-09-08; this is a compliance exposure, not a
+    cosmetic bug.
+
+    Kept deliberately conservative in the other direction: a false positive
+    silently removes a real customer from their own follow-up, so ambiguous
+    words ("cancel", "end") still only count as an exact whole-body match, which
+    is also what the carrier-level standard defines.
+    """
+    normalized = re.sub(r"[^a-z ]", " ", body.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+
+    # 1. Exact whole-body match -- the carrier-standard keywords, unchanged.
+    if normalized in OPT_OUT_KEYWORDS:
+        return True
+
+    # 2. An unambiguous keyword as the FIRST word ("stop texting me").
+    first = normalized.split(" ", 1)[0]
+    if first in OPT_OUT_LEADING:
+        return True
+
+    # 3. Common explicit phrasings anywhere in the message.
+    return any(phrase in normalized for phrase in OPT_OUT_PHRASES)
+
 
 def _admin_api_request(method, path, params=None, json_body=None, auth=True):
     url = f"{ADMIN_API_BASE}{path}"
@@ -1040,6 +1164,7 @@ def build_gather(language):
 
 
 @app.route("/voice", methods=["POST"])
+@require_twilio_signature
 def voice():
     call_sid = request.form.get("CallSid")
     sessions[call_sid] = {"history": [], "language": DEFAULT_LANGUAGE}
@@ -1078,6 +1203,7 @@ def voice():
 
 
 @app.route("/gather", methods=["POST"])
+@require_twilio_signature
 def gather():
     call_sid = request.form.get("CallSid")
     speech = request.form.get("SpeechResult", "")
@@ -1129,6 +1255,7 @@ def gather():
 
 
 @app.route("/sms", methods=["POST"])
+@require_twilio_signature
 def sms():
     # Texts to the shop number, answered by the same Mia that answers calls:
     # same SYSTEM_PROMPT, same brand facts, same hours logic, same tools.
@@ -1158,8 +1285,7 @@ def sms():
     # instead of an unsubscribe, and the next automated cycle texted them.
     # Keyword-based and independent of Claude on purpose: an opt-out must never
     # be missed because a reply was ambiguous.
-    lowered = re.sub(r"[^a-z ]", "", body.lower()).strip()
-    if lowered in OPT_OUT_KEYWORDS:
+    if is_opt_out(body):
         if not _record_opt_out(from_number, body):
             # Confirming an opt-out we failed to persist would be a lie -- the
             # next cycle would text them anyway. Say so loudly; a human can
