@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 import os
 import re
 import requests
@@ -178,31 +178,31 @@ LANGUAGES = {
         "no_catch": "Sorry, I didn't catch that -- could you say that again?",
         "no_hearing": "Sorry, I'm having trouble hearing you. Please call back. Goodbye.",
         "message_taken_fallback": "Got it, thanks -- we'll give you a call back soon!",
-        "switch_keywords": ["english", "inglés", "ingles"],
+        "switch_keywords": ["english", "inglÃ©s", "ingles"],
     },
     "es": {
         "name": "Spanish",
         "gather_language": "es-MX",
         "voice": "Polly.Penelope",
-        "goodbye": "Gracias por llamar a Twin Wireless. ¡Hasta luego!",
-        "no_catch": "Perdón, no te escuché bien -- ¿puedes repetir eso?",
-        "no_hearing": "Perdón, tengo problemas para escucharte. Por favor llama de nuevo. Adiós.",
+        "goodbye": "Gracias por llamar a Twin Wireless. Â¡Hasta luego!",
+        "no_catch": "PerdÃ³n, no te escuchÃ© bien -- Â¿puedes repetir eso?",
+        "no_hearing": "PerdÃ³n, tengo problemas para escucharte. Por favor llama de nuevo. AdiÃ³s.",
         "message_taken_fallback": "Listo, gracias -- te llamaremos pronto.",
         "switch_keywords": [
-            "español",
+            "espaÃ±ol",
             "espanol",
             "spanish",
             "hola",
             "gracias",
             "por favor",
-            "cómo",
+            "cÃ³mo",
             "como estas",
-            "dónde",
-            "cuándo",
+            "dÃ³nde",
+            "cuÃ¡ndo",
             "ayuda",
             "reparar",
             "pantalla",
-            "teléfono",
+            "telÃ©fono",
             "telefono",
         ],
     },
@@ -223,7 +223,7 @@ in that case, greet the caller by introducing yourself as {AGENT_NAME} from Twin
 ask what they need, using the correct greeting for whether the shop is currently open or
 closed (you will be told the current status below). On this first greeting only, add one
 short, natural line letting Spanish speakers know they can continue in Spanish (e.g. "-- y
-también hablo español, si prefieres.").
+tambiÃ©n hablo espaÃ±ol, si prefieres.").
 
 TONE: Warm and friendly, like a helpful person at the counter who's genuinely glad to hear
 from you -- not a call center, but not stiff either. Talk like a real person: contractions,
@@ -242,7 +242,7 @@ may add more languages later. Every caller message below is prefixed with a tag 
 currently using -- always reply ONLY in that language, translating the tone, facts, and rules
 in this prompt naturally into it. Never mix two languages in one reply, and never mention the
 tag itself. If a caller explicitly asks to switch languages ("can we do this in English?",
-"en español, por favor"), switch immediately on your very next reply. Exception: when calling
+"en espaÃ±ol, por favor"), switch immediately on your very next reply. Exception: when calling
 the take_message tool, always write caller_name and summary in plain English regardless of
 the conversation's language, since the shop team reads these messages in English.
 
@@ -366,8 +366,8 @@ def detect_language(text, current_language):
 # SYSTEM_PROMPT is written for voice ("You are answering a live phone call...
 # spoken aloud by text-to-speech"). Reusing it verbatim for SMS made Mia open a
 # text with "Thanks for calling", and the prompt's Spanish example begins with
-# "--", which the model glued an English "and" onto: "-- and y también hablo
-# español". Both were live in a real customer text.
+# "--", which the model glued an English "and" onto: "-- and y tambiÃ©n hablo
+# espaÃ±ol". Both were live in a real customer text.
 #
 # Rather than fork the prompt, SMS appends an override. Last instruction wins,
 # and the voice path is untouched.
@@ -1483,10 +1483,90 @@ def send_pos_review():
     )
     try:
         msg = twilio_client.messages.create(to=phone, from_=TWILIO_FROM_NUMBER, body=body)
-        return {"ok": True, "sid": msg.sid, "phone_tail": phone[-4:]}
     except Exception as exc:
         print(f"send_pos_review failed for ...{phone[-4:]}: {exc}")
         return {"ok": False, "error": str(exc)}, 502
+
+    # Mirror the send into the admin Follow-Ups store so the dashboard shows
+    # POS-driven review texts alongside website ones (Murad, 2026-09-08:
+    # "needs to show in admin followups panel so i see whats pending and whats
+    # recieved"). Recording is best-effort: the TEXT went out either way, and
+    # the nightly sync repairs any record this misses.
+    _upsert_pos_followup(
+        repair_id=str(data.get("repairId") or ""),
+        phone=phone,
+        name=(data.get("name") or "").strip(),
+        device=device,
+        completed_at=(data.get("completedAt") or "").strip(),
+        status="sent",
+        sent_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    )
+    return {"ok": True, "sid": msg.sid, "phone_tail": phone[-4:]}
+
+
+def _upsert_pos_followup(repair_id, phone, name, device, completed_at, status,
+                         sent_at=None, note=None):
+    """Create-or-update a `pos-<id>` record in the website follow-ups store.
+
+    Never raises: panel visibility must not break sending. Skips silently when
+    repair_id is missing (nothing stable to key the record on)."""
+    if not repair_id:
+        return
+    record_id = f"pos-{repair_id}"
+    try:
+        _admin_api_post("/admin-api/followups.php", {
+            "appointmentId": record_id,
+            "phone": phone,
+            "fulfilledAt": completed_at or datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "customerName": name,
+            "deviceLabel": device,
+            "source": "pos",
+            "note": note or "",
+        })
+        updates = {"appointmentId": record_id, "followUpStatus": status}
+        if sent_at:
+            updates["followupSentAt"] = sent_at
+            updates["reviewRequestSent"] = True
+        if note:
+            updates["note"] = note
+        _admin_api_patch("/admin-api/followups.php", updates)
+    except Exception as exc:
+        print(f"_upsert_pos_followup({record_id}) failed: {exc}")
+
+
+@app.route("/pos-review-sync", methods=["POST"])
+def pos_review_sync():
+    # Batch state sync from the shop machine: pending repairs waiting to
+    # mature, and historical sends (the 2026-09-08 backfill) â€” records ONLY,
+    # this never texts anyone. Same auth as /send-pos-review.
+    given = request.headers.get("X-Webhook-Secret", "")
+    accepted = {s for s in (os.environ.get("POS_REVIEW_SECRET", ""), NOTIFY_WEBHOOK_SECRET) if s}
+    if not accepted or given not in accepted:
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(silent=True) or {}
+    records = data.get("records") or []
+    if not isinstance(records, list) or len(records) > 100:
+        return {"error": "records must be a list of at most 100"}, 400
+
+    done = 0
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        phone = _normalize_phone(r.get("phone", "")) or ""
+        status = r.get("status") if r.get("status") in ("pending", "sent") else "pending"
+        _upsert_pos_followup(
+            repair_id=str(r.get("repairId") or ""),
+            phone=phone,
+            name=(r.get("name") or "").strip(),
+            device=(r.get("device") or "").strip(),
+            completed_at=(r.get("completedAt") or "").strip(),
+            status=status,
+            sent_at=(r.get("sentAt") or "").strip() or None,
+            note=(r.get("note") or "").strip() or None,
+        )
+        done += 1
+    return {"ok": True, "processed": done}
 
 
 # Single gunicorn worker (see README's Start command: `gunicorn app:app`, no
