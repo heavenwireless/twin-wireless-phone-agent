@@ -22,20 +22,44 @@ Two corrections to what this file previously assumed:
 10:43:41. That single line proves the decorator is deployed, that it correctly
 rejects an unsigned request, and that log mode does not drop traffic.
 
-### Still to do — the bake period
+### Bake period COMPLETE — now ENFORCING
 
-`TWILIO_VALIDATE` is at its default `log`. **A real Twilio request has not yet
-been observed.** Before enforcing:
+Murad sent a real text and placed a real call at ~10:46–10:59 CDT. All three
+guarded endpoints validated genuine Twilio traffic:
 
-1. Place a genuine call or text to **(318) 723-9666** — Mia's number directly,
-   NOT the published (318) 670-3938, which still has the carrier
-   silent-forwarding fault.
-2. Search Render logs for `TWILIO-SIG`. Expect `ok path=/sms` or `ok path=/voice`.
-3. **Only if `ok` appears for real traffic:** add env var
-   `TWILIO_VALIDATE=enforce` and redeploy. Invalid signatures then get 403.
-4. If real traffic instead shows `WOULD-REJECT`, do NOT enforce — the URL
-   scheme or proxy headers need adjusting first. Log mode exists precisely so
-   this is discovered without dropping a customer's call.
+```
+10:43:41  TWILIO-SIG WOULD-REJECT path=/voice  (my unsigned probe — correctly caught)
+10:46:25  TWILIO-SIG ok path=/sms    mode=log  (his real text)
+10:58:54  TWILIO-SIG ok path=/voice  mode=log  (his real call)
+10:59:06  TWILIO-SIG ok path=/gather mode=log  (the speech turn of that call)
+```
+
+Complete coverage — every guarded endpoint proven against real traffic before
+enforcing. `TWILIO_VALIDATE=enforce` was then set as a Render env var
+(Save and deploy) at ~11:01 CDT.
+
+**Verified after enforcing:**
+
+| Check | Result |
+|---|---|
+| Unsigned `POST /voice` | **403 Forbidden** (was 200 under log mode) |
+| Unsigned `POST /sms` | **403 Forbidden** |
+| `GET /` | 200 |
+| `GET /followups/status` | 200, `sent:3 total:3` — follow-up agent unaffected |
+| Service health | 3 consecutive 200s post-deploy |
+
+The hole is closed: a forged webhook can no longer drive a Claude turn or make
+the shop's number send an SMS.
+
+**Note on the silent call.** Murad's test call, when unanswered, still went
+silent. That is the pre-existing AT&T conditional-forwarding fault, NOT this
+change — the logs show `/voice` and `/gather` both validated and were processed,
+i.e. the app spoke its whole script and the audio never reached the caller.
+Log mode also cannot drop traffic by construction. Unchanged, still blocked on
+the Twilio ticket → AT&T.
+
+**Emergency escape:** set `TWILIO_VALIDATE=off` (no code change) or roll back to
+`0ba0cfa`.
 
 Both fixes come from the 2026-09-08 read-only audit:
 
