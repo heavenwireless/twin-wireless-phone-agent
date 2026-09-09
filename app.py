@@ -1428,6 +1428,35 @@ def notify_new_appointment():
         return {"ok": False, "error": str(exc)}, 502
 
 
+@app.route("/notify-owner", methods=["POST"])
+def notify_owner():
+    # Generic "text Murad" endpoint for the shop machine's routines -- first
+    # use: the TikTok-draft reminder (Murad, 2026-09-09: "make a reminder for
+    # me to go publish tiktok videos when they are ready also get the caption
+    # ready for me to copy and paste"). The reminder text includes the caption
+    # so he can copy it straight into TikTok on his phone.
+    # Auth: same pair of secrets the POS review routes accept.
+    given = request.headers.get("X-Webhook-Secret", "")
+    accepted = {s for s in (os.environ.get("POS_REVIEW_SECRET", ""), NOTIFY_WEBHOOK_SECRET) if s}
+    if not accepted or given not in accepted:
+        return {"error": "unauthorized"}, 401
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return {"error": "text required"}, 400
+    try:
+        # Twilio hard-caps a message body at 1600 chars; captions fit well
+        # under that, and anything longer is trimmed rather than erroring.
+        msg = twilio_client.messages.create(
+            to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=text[:1500]
+        )
+        return {"ok": True, "sid": msg.sid}
+    except Exception as exc:
+        print(f"notify_owner failed: {exc}")
+        return {"ok": False, "error": str(exc)}, 502
+
+
 @app.route("/send-pos-review", methods=["POST"])
 def send_pos_review():
     # Review request for a repair tracked in the CellPoint Pro POS -- Murad's
