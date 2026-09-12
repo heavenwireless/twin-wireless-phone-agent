@@ -115,6 +115,14 @@ def require_twilio_signature(view):
 
 REVIEW_LINK = "https://g.page/r/CdNI_z0bef6qEBM/review"
 
+# One shared social-follow line for every follow-up text (Murad, 2026-09-11:
+# ask customers to "support us on our social media"). Handles match the
+# site footer exactly -- twinswireless on all three platforms.
+SOCIAL_LINE = (
+    "Keep up with our deals: facebook.com/twinswireless | "
+    "instagram.com/twinswireless | tiktok.com/@twinswireless"
+)
+
 # --- Diagnostic: pre-recorded opening greeting -----------------------------
 # Test for the AT&T conditional-forwarding silent-audio bug: does a PLAYed
 # static audio file survive the broken no-answer/busy forwarding leg where
@@ -417,6 +425,12 @@ already have their name and phone number on file from that exact appointment.
   Do NOT reply with anything like "Can I get your name and number?" -- you already have both.
 - A question about another service: answer it the same as any other conversation, from what
   you already know Twin Wireless offers.
+- Feedback or a suggestion about our service, prices, staff, or how we could improve
+  (that is NOT a complaint needing a callback): thank them genuinely and specifically --
+  their exact words are automatically recorded for the owner, so tell them "I've passed
+  that straight to the owner" and mean it. Do not use any tool for plain feedback.
+- If they ask where to find us on social media: Facebook and Instagram are @twinswireless,
+  TikTok is @twinswireless.
 """
 
 
@@ -702,7 +716,9 @@ def send_callback_request_sms(reason, phone, appointment_id):
 
 FOLLOWUP_DEFAULT_SETTINGS = {
     "enabled": True,
-    "delayHours": 24,
+    # 72 = Murad's rule (2026-09-11): every customer gets their text 3 days
+    # after pickup, matching the POS flow's long-standing 3-day gate.
+    "delayHours": 72,
     "sendingHoursStart": 9,
     "sendingHoursEnd": 20,
     "googleReviewUrl": REVIEW_LINK,
@@ -935,14 +951,18 @@ def _service_recommendation(appointment):
 def _build_followup_message(appointment, settings):
     first_name = (appointment.get("firstName") or "").strip() or "there"
     review_url = settings.get("googleReviewUrl") or REVIEW_LINK
-    website_url = settings.get("websiteUrl") or "https://www.twin-wireless.com"
 
+    # Expanded copy per Murad 2026-09-11: besides the review ask, every
+    # follow-up now (a) invites honest experience/improvement feedback --
+    # replies land in the admin panel via the /sms customerResponse capture --
+    # and (b) asks for a social follow. The generic website plug was dropped
+    # to keep the text at a reasonable length.
     parts = [
-        f"Hi {first_name}! This is Twin Wireless. We wanted to check in and make sure "
-        "everything is working great after your recent visit. We really appreciate your "
-        "business!",
-        "If you had a great experience, we'd really appreciate an honest Google review "
-        f"about it: {review_url}",
+        f"Hi {first_name}! This is Twin Wireless. Just checking in on your repair -- "
+        "how's everything holding up? Reply and tell us honestly, good or bad. Your "
+        "feedback helps us improve our service and our team.",
+        "If we earned it, a quick Google review means a lot to our local shop: "
+        f"{review_url}",
     ]
 
     if settings.get("serviceRecommendationsEnabled", True):
@@ -950,10 +970,7 @@ def _build_followup_message(appointment, settings):
         if recommendation:
             parts.append(recommendation)
 
-    parts.append(
-        "And if you ever need phone repair, accessories, upgrades, activation, or anything "
-        f"else we offer, everything's here: {website_url}"
-    )
+    parts.append(SOCIAL_LINE)
 
     return " ".join(parts)[:1400]
 
@@ -1503,12 +1520,26 @@ def send_pos_review():
     except Exception as exc:
         print(f"send_pos_review: followups dedupe unavailable, proceeding: {exc}")
 
+    # Purchases (invoice customers, repairId "inv-...") get purchase wording;
+    # everything else is a repair. Both now carry the experience/improvement
+    # ask and the social-follow line (Murad, 2026-09-11).
+    is_purchase = str(data.get("repairId") or "").startswith("inv-")
     what = f"your {device}" if device else "your device"
+    if is_purchase:
+        opener = (
+            f"Hi {first_name}! This is Twin Wireless. Just checking in -- how's "
+            f"{what} treating you? Reply and tell us honestly, good or bad. Your "
+            "feedback helps us improve our service and our team."
+        )
+    else:
+        opener = (
+            f"Hi {first_name}! This is Twin Wireless. Just checking in -- how's "
+            f"{what} holding up since the repair? Reply and tell us honestly, good "
+            "or bad. Your feedback helps us improve our service and our team."
+        )
     body = (
-        f"Hi {first_name}! This is Twin Wireless. We wanted to check in and make sure "
-        f"everything is working great with {what} after your repair. We really "
-        "appreciate your business! If you had a great experience, we'd really "
-        f"appreciate an honest Google review: {REVIEW_LINK}"
+        f"{opener} If we earned it, a quick Google review means a lot to our "
+        f"local shop: {REVIEW_LINK} {SOCIAL_LINE}"
     )
     try:
         msg = twilio_client.messages.create(to=phone, from_=TWILIO_FROM_NUMBER, body=body)

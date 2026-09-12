@@ -1,5 +1,42 @@
 # Status — 2026-09-03
 
+## 2026-09-11 — Follow-up texts expanded: feedback ask + social follow + 3-day delay
+
+Murad's directive (in his words): ask all follow-up customers "for reviews and
+support on our social media, also to ask them about their experience and how we
+can improve our service and staff", and "each customer going to receive a link
+3 days after the pickup date".
+
+What changed (all in `app.py`, no new endpoints, no schema changes):
+
+1. **`SOCIAL_LINE` constant** (near `REVIEW_LINK`): one shared
+   "Keep up with our deals: facebook.com/twinswireless |
+   instagram.com/twinswireless | tiktok.com/@twinswireless" line — handles
+   match the site footer exactly.
+2. **`_build_followup_message()`** (website appointments): new copy — check-in
+   plus an explicit "reply and tell us honestly, good or bad, your feedback
+   helps us improve our service and our team", then the review ask, then the
+   optional live-catalog service recommendation, then `SOCIAL_LINE`. The
+   generic "everything's here: website" closer was dropped for length.
+3. **`/send-pos-review` body**: same three asks; wording branches on
+   `repairId` prefix — `inv-…` (invoice customers, e.g. phone purchases) gets
+   "how's your X treating you?", everything else "how's your X holding up
+   since the repair?".
+4. **`FOLLOWUP_REPLY_NOTE`**: two new bullets — plain feedback/suggestions get
+   a genuine thank-you ("passed straight to the owner"; the `/sms` handler
+   already records their exact words to `customerResponse`, no tool needed),
+   and social-media questions get the @twinswireless handles.
+5. **`FOLLOWUP_DEFAULT_SETTINGS.delayHours` 24 → 72** — and the LIVE value in
+   the website's `data/site-settings.json` was flipped to 72 the same night
+   (via SSH). Every source now waits 3 days after pickup: website (72h after
+   `fulfilledAt`), POS repairs (send-reviews.py's existing ≥3-days gate),
+   invoice customers (same gate on purchase date).
+
+Feedback replies were already being captured (`customerResponse` PATCH on
+every follow-up-thread reply) and shown in /admin/follow-ups — that pipeline
+is unchanged and is what makes the "how can we improve" ask actually land
+somewhere Murad reads.
+
 ## 2026-09-08 — TWO SECURITY FIXES **DEPLOYED**, running in LOG MODE
 
 **Deployed 10:41:42 CDT**, deploy `dep-dag2pdm7bikc73ct0cig`, source `0b50909`,
@@ -728,3 +765,22 @@ keep it and add a check that the recordings match the text. Needs Murad's call
 3. Don't modify `build_gather()`, `/voice`, or `/gather` timing again without
    a real forwarded test call's logs showing a *specific* new timing problem
    — the three fixes above already closed out everything the logs showed.
+
+## 2026-09-09 � follow-up agent health monitor (closes the plan's last item)
+
+The one unbuilt piece of the follow-up-agent plan was the monitoring routine
+("periodically confirm the scheduler is alive + surface Needs Staff Attention
+records"). Now built, OUTSIDE this repo, on the shop Windows machine:
+
+- `Desktop\TWIN-WIRELESS-AI\pos\followup-monitor.py` � hits
+  `GET /followups/status` and texts the owner via `/notify-owner` ONLY when
+  (a) needsStaffAttention grows, (b) the service is unreachable (one alert
+  per outage), or (c) `configured` goes false (admin login lost on Render).
+  Quiet when healthy. One-shot alerting state in
+  `routines\logs\followup-monitor-state.json`.
+- Windows task "TwinWireless FollowUp Monitor", every 4 hours from 8 AM,
+  StartWhenAvailable + battery-safe. Verified: manual run exit 0, healthy
+  status (sent=13 pending=2 needsStaffAttention=0 optedOut=0), no text sent.
+
+Status at close: system fully live end to end � 13 follow-ups sent, 0 staff
+escalations, 0 opt-outs.
