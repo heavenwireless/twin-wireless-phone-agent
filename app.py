@@ -127,7 +127,7 @@ SOCIAL_LINE = (
 # Test for the AT&T conditional-forwarding silent-audio bug: does a PLAYed
 # static audio file survive the broken no-answer/busy forwarding leg where
 # live-generated <Say> TTS does not? Only the opening line changes -- every
-# later Mia reply is still real, dynamic <Say> TTS (it has to be, it's a
+# later agent reply is still real, dynamic <Say> TTS (it has to be, it's a
 # unique response to whatever the caller just said), so this can prove or
 # rule out "it's specifically live TTS audio" but can't be a full fix on its
 # own. See STATUS.md. Remove this block (and revert /voice) once the AT&T
@@ -181,43 +181,61 @@ LANGUAGES = {
     "en": {
         "name": "English",
         "gather_language": "en-US",
-        "voice": "Polly.Joanna",
+        # Neural tier, not Generative -- Generative sounds a shade warmer but
+        # renders noticeably slower, and this voice covers the fixed opening
+        # greeting that every single caller hears (see opening_greeting()'s
+        # own comment on why that line must never be slow). Matthew-Neural is
+        # Polly's standard warm, professional American male voice.
+        "voice": "Polly.Matthew-Neural",
         "goodbye": "Thanks for calling Twin Wireless. Goodbye.",
         "no_catch": "Sorry, I didn't catch that -- could you say that again?",
         "no_hearing": "Sorry, I'm having trouble hearing you. Please call back. Goodbye.",
         "message_taken_fallback": "Got it, thanks -- we'll give you a call back soon!",
-        "switch_keywords": ["english", "inglÃ©s", "ingles"],
+        "switch_keywords": ["english", "inglés", "ingles"],
     },
     "es": {
         "name": "Spanish",
         "gather_language": "es-MX",
-        "voice": "Polly.Penelope",
-        "goodbye": "Gracias por llamar a Twin Wireless. Â¡Hasta luego!",
-        "no_catch": "PerdÃ³n, no te escuchÃ© bien -- Â¿puedes repetir eso?",
-        "no_hearing": "PerdÃ³n, tengo problemas para escucharte. Por favor llama de nuevo. AdiÃ³s.",
-        "message_taken_fallback": "Listo, gracias -- te llamaremos pronto.",
+        # Andres-Neural -- Polly's native Mexican Spanish MALE voice, Neural
+        # tier for the same latency reason as English above. Murad's spec
+        # (2026-09-13) asked to investigate alternatives before defaulting to
+        # Polly; Polly already has a real es-MX male Neural voice, which
+        # clears his own bar against migrating without a genuine gap to fix
+        # (see the ElevenLabs comparison note on the English voice above --
+        # same reasoning applies here, just with a "no gap found" outcome).
+        "voice": "Polly.Andres-Neural",
+        "goodbye": "Gracias por llamar a Twin Wireless. ¡Que tenga buen día!",
+        "no_catch": "Perdón, no escuché bien -- ¿me lo puede repetir?",
+        "no_hearing": "Perdón, tengo problemas para escucharlo. Por favor llame de nuevo. Hasta luego.",
+        "message_taken_fallback": "Listo, muchas gracias -- le llamamos pronto.",
         "switch_keywords": [
-            "espaÃ±ol",
+            "español",
             "espanol",
             "spanish",
             "hola",
             "gracias",
             "por favor",
-            "cÃ³mo",
-            "como estas",
-            "dÃ³nde",
-            "cuÃ¡ndo",
+            "cómo",
+            "como esta",
+            "dónde",
+            "cuándo",
             "ayuda",
             "reparar",
             "pantalla",
-            "telÃ©fono",
+            "teléfono",
             "telefono",
         ],
     },
 }
 DEFAULT_LANGUAGE = "en"
 
-AGENT_NAME = "Mia"
+AGENT_NAME = "Khaled"
+# English TTS reads "Khaled" as "Kay-led" or "Kal-ed" -- English has no "kh"
+# sound. This respelling is ONLY for the fixed opening_greeting() below,
+# which is plain Python text with no SSML/prompt layer to catch it the way
+# Claude's own replies are handled (see the MULTI-LANGUAGE pronunciation note
+# in SYSTEM_PROMPT for the Spanish equivalent, "Jaled").
+AGENT_NAME_SPOKEN_EN = "Kha-led"
 
 SYSTEM_PROMPT = f"""You are {AGENT_NAME}, the phone assistant for Twin Wireless, a device
 repair shop at 2328 Line Ave, Shreveport, LA 71104, phone (318) 670-3938, website
@@ -231,7 +249,7 @@ in that case, greet the caller by introducing yourself as {AGENT_NAME} from Twin
 ask what they need, using the correct greeting for whether the shop is currently open or
 closed (you will be told the current status below). On this first greeting only, add one
 short, natural line letting Spanish speakers know they can continue in Spanish (e.g. "-- y
-tambiÃ©n hablo espaÃ±ol, si prefieres.").
+también hablo español, si prefiere.").
 
 TONE: Warm and friendly, like a helpful person at the counter who's genuinely glad to hear
 from you -- not a call center, but not stiff either. Talk like a real person: contractions,
@@ -250,9 +268,18 @@ may add more languages later. Every caller message below is prefixed with a tag 
 currently using -- always reply ONLY in that language, translating the tone, facts, and rules
 in this prompt naturally into it. Never mix two languages in one reply, and never mention the
 tag itself. If a caller explicitly asks to switch languages ("can we do this in English?",
-"en espaÃ±ol, por favor"), switch immediately on your very next reply. Exception: when calling
+"en español, por favor"), switch immediately on your very next reply. Exception: when calling
 the take_message tool, always write caller_name and summary in plain English regardless of
 the conversation's language, since the shop team reads these messages in English.
+
+Your own name is the one exception to writing things exactly as they look: neither English
+nor Spanish text-to-speech reads "Khaled" correctly on its own (English has no "kh" sound and
+tends to read it as "Kay-led" or "Kal-ed"; Spanish G2P without help can land on "Ka-led").
+When you say your own name out loud, spell it "Kha-led" in English replies and "Jaled" in
+Spanish replies -- Spanish "j" already makes the same sound as the "kh" in Khaled natively, so
+that spelling is what actually produces the correct pronunciation, not a compromise. Never use
+either spelling anywhere else (tool calls, written text, this instruction) -- only when your
+own name is a word you are about to speak.
 
 NON-NEGOTIABLE RULES:
 - Never claim Apple certification, authorization, or "genuine Apple parts." If asked about
@@ -372,10 +399,10 @@ def detect_language(text, current_language):
 
 
 # SYSTEM_PROMPT is written for voice ("You are answering a live phone call...
-# spoken aloud by text-to-speech"). Reusing it verbatim for SMS made Mia open a
-# text with "Thanks for calling", and the prompt's Spanish example begins with
-# "--", which the model glued an English "and" onto: "-- and y tambiÃ©n hablo
-# espaÃ±ol". Both were live in a real customer text.
+# spoken aloud by text-to-speech"). Reusing it verbatim for SMS made the agent
+# open a text with "Thanks for calling", and the prompt's Spanish example
+# begins with "--", which the model glued an English "and" onto: "-- and y
+# también hablo español". Both were live in a real customer text.
 #
 # Rather than fork the prompt, SMS appends an override. Last instruction wins,
 # and the voice path is untouched.
@@ -611,7 +638,7 @@ def shop_open_status():
 
 
 # The opening line used to come from call_claude(), which means every single
-# call paid for a live Claude API round-trip before Mia said one word. A real
+# call paid for a live Claude API round-trip before the agent said one word. A real
 # forwarded call on 2026-09-03 confirmed this is not just theoretical: /voice
 # took 1293ms to respond, and the entire call lasted 4 seconds total -- not
 # nearly long enough for the greeting to have even finished playing, meaning
@@ -629,11 +656,11 @@ def shop_open_status():
 def opening_greeting(is_open, next_open_text):
     if is_open:
         return (
-            "Hey there! This is Mia from Twin Wireless. What can I help you with today? "
+            f"Hey there! This is {AGENT_NAME_SPOKEN_EN} from Twin Wireless. What can I help you with today? "
             "-- and I also speak Spanish, if you prefer."
         )
     return (
-        f"Hey there! This is Mia from Twin Wireless. We're closed right now, back open "
+        f"Hey there! This is {AGENT_NAME_SPOKEN_EN} from Twin Wireless. We're closed right now, back open "
         f"{next_open_text} -- but go ahead and tell me what's going on, I'll do what I can. "
         "-- and I also speak Spanish, if you prefer."
     )
@@ -1197,7 +1224,7 @@ def voice():
     # and it did its job: the recording was silent on exactly the same calls,
     # which ruled out text-to-speech as the cause. Keeping it running had a
     # real cost -- nothing tied the .wav files to opening_greeting()'s text,
-    # so editing the hours or the wording would have left Mia speaking a stale
+    # so editing the hours or the wording would have left the agent speaking a stale
     # recording while every code-level check still passed.
     # The /audio route and static_audio/ are deliberately kept, so the
     # diagnostic can be re-armed by restoring the four lines below if AT&T
@@ -1274,7 +1301,7 @@ def gather():
 @app.route("/sms", methods=["POST"])
 @require_twilio_signature
 def sms():
-    # Texts to the shop number, answered by the same Mia that answers calls:
+    # Texts to the shop number, answered by the same agent that answers calls:
     # same SYSTEM_PROMPT, same brand facts, same hours logic, same tools.
     #
     # Before this existed the number's messaging webhook still pointed at
@@ -1297,7 +1324,7 @@ def sms():
     # about follow-up threads. It used to live under `if followup_record:`,
     # and _followup_context() only returns records already in status "sent" --
     # so a STOP sent pre-emptively, or by someone who had only ever received a
-    # review or financing link from Mia, was never recorded at all and fell
+    # review or financing link from the agent, was never recorded at all and fell
     # through to Claude as ordinary chat. The customer got a chatty reply
     # instead of an unsubscribe, and the next automated cycle texted them.
     # Keyword-based and independent of Claude on purpose: an opt-out must never
@@ -1481,7 +1508,7 @@ def send_pos_review():
     # website bookings; walk-in repairs live in the POS and never got asked.
     # A routine on the shop machine reads the POS export, decides WHO is due
     # (its own ledger enforces one-text-per-repair), and calls this to do the
-    # actual send from Mia's number.
+    # actual send from the agent's number.
     #
     # This endpoint deliberately owns the last line of defence regardless of
     # what the caller decides:
