@@ -181,12 +181,18 @@ LANGUAGES = {
     "en": {
         "name": "English",
         "gather_language": "en-US",
-        # Neural tier, not Generative -- Generative sounds a shade warmer but
-        # renders noticeably slower, and this voice covers the fixed opening
-        # greeting that every single caller hears (see opening_greeting()'s
-        # own comment on why that line must never be slow). Matthew-Neural is
-        # Polly's standard warm, professional American male voice.
-        "voice": "Polly.Matthew-Neural",
+        # Standard tier, not Neural -- tried Neural first (better quality)
+        # but Murad reported real dead air on pickup even with it, on the
+        # exact fixed line every single caller hears first (see
+        # opening_greeting()'s own comment on a real call that dropped during
+        # this kind of silence). Standard is what the original Joanna voice
+        # used, with no such complaint in years of production use, so this
+        # reverts to that same speed characteristic with a male voice
+        # (Matthew) rather than risk it again. Once the greeting is served as
+        # pre-rendered audio via the existing static_audio/ + /audio
+        # infrastructure instead of live <Say>, Neural or Generative becomes
+        # safe to use again with no latency cost -- see GREETING_AUDIO_FILES.
+        "voice": "Polly.Matthew",
         "goodbye": "Thanks for calling Twin Wireless. Goodbye.",
         "no_catch": "Sorry, I didn't catch that -- could you say that again?",
         "no_hearing": "Sorry, I'm having trouble hearing you. Please call back. Goodbye.",
@@ -196,13 +202,17 @@ LANGUAGES = {
     "es": {
         "name": "Spanish",
         "gather_language": "es-MX",
-        # Andres-Neural -- Polly's native Mexican Spanish MALE voice, Neural
-        # tier for the same latency reason as English above. Murad's spec
-        # (2026-09-13) asked to investigate alternatives before defaulting to
-        # Polly; Polly already has a real es-MX male Neural voice, which
-        # clears his own bar against migrating without a genuine gap to fix
-        # (see the ElevenLabs comparison note on the English voice above --
-        # same reasoning applies here, just with a "no gap found" outcome).
+        # Andres-Neural -- Polly's native Mexican Spanish MALE voice. Unlike
+        # English, there is no Standard-tier fallback to drop to here: Polly's
+        # only Standard es-MX voice is "Mia" (female); "Andres" exists at
+        # Neural and Generative only (confirmed against Twilio's own voice
+        # table 2026-09-13, not assumed). Neural is already the fastest male
+        # option Polly has for this locale. This voice is only used mid-call
+        # after a caller explicitly asks for Spanish, not on the critical
+        # first-word-of-the-call path the English voice above had to protect,
+        # so its latency is a smaller concern -- but if it ever needs to be
+        # faster too, pre-rendered audio (see the English voice's note) is
+        # the way to get there without dropping to a female voice.
         "voice": "Polly.Andres-Neural",
         "goodbye": "Gracias por llamar a Twin Wireless. ¡Que tenga buen día!",
         "no_catch": "Perdón, no escuché bien -- ¿me lo puede repetir?",
