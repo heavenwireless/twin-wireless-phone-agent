@@ -1,6 +1,7 @@
 ﻿import datetime
 import os
 import re
+import time
 import requests
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -589,6 +590,11 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice", f
             }
         )
 
+    # Temporary timing instrumentation, 2026-09-13 -- Murad reported ~10s of
+    # silence after speaking during /gather. This isolates whether that's the
+    # Claude call itself vs. something else in the request (TTS synthesis,
+    # network, Twilio-side). Remove once the real bottleneck is found and fixed.
+    _t0 = time.monotonic()
     response = claude.messages.create(
         model=MODEL,
         max_tokens=300,
@@ -596,6 +602,7 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice", f
         tools=tools,
         messages=history,
     )
+    print(f"TIMING call_claude: messages.create took {time.monotonic() - _t0:.2f}s")
 
     spoken_parts = []
     tool_call = None
