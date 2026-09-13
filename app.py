@@ -1,7 +1,6 @@
 ﻿import datetime
 import os
 import re
-import time
 import requests
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -590,19 +589,20 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice", f
             }
         )
 
-    # Temporary timing instrumentation, 2026-09-13 -- Murad reported ~10s of
-    # silence after speaking during /gather. This isolates whether that's the
-    # Claude call itself vs. something else in the request (TTS synthesis,
-    # network, Twilio-side). Remove once the real bottleneck is found and fixed.
-    _t0 = time.monotonic()
+    # max_tokens capped at 120, not 300 -- confirmed via timing logs that the
+    # Claude call itself is fast (1.6-2.4s) and not the source of reported
+    # /gather delay, but every extra token Claude is allowed to generate is
+    # also extra text Polly has to synthesize before the caller hears
+    # anything. SYSTEM_PROMPT already asks for "a sentence or two"; this
+    # makes that a hard ceiling so a longer reply can't add synthesis delay
+    # on top of whatever caused the reported silence.
     response = claude.messages.create(
         model=MODEL,
-        max_tokens=300,
+        max_tokens=120,
         system=system_prompt,
         tools=tools,
         messages=history,
     )
-    print(f"TIMING call_claude: messages.create took {time.monotonic() - _t0:.2f}s")
 
     spoken_parts = []
     tool_call = None
@@ -1208,7 +1208,17 @@ def build_gather(language):
         input="speech",
         action="/gather",
         method="POST",
-        speech_timeout="auto",
+        # Was "auto" -- Twilio's adaptive end-of-speech detection, which is
+        # tuned to avoid cutting callers off but can add several extra
+        # seconds of silence after the caller actually stops talking before
+        # it finalizes and posts to /gather. Murad reported ~10s of silence
+        # after speaking; the Claude call itself measures 1.6-2.4s (see the
+        # capped max_tokens above), so the rest of that gap is most likely
+        # here, on Twilio's side, not in this app. A fixed 2s is still a
+        # full natural pause -- long enough that a caller collecting their
+        # thoughts mid-sentence won't get cut off -- but removes whatever
+        # extra tail "auto" was adding on top of it.
+        speech_timeout="2",
         # Was 6. Two real forwarded test calls both ended at EXACTLY
         # greeting-length + 6s, matching the retry-generation timestamp in
         # Twilio's own logs to the second -- the caller sat through 6 full
