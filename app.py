@@ -197,7 +197,19 @@ LANGUAGES = {
         "no_catch": "Sorry, I didn't catch that -- could you say that again?",
         "no_hearing": "Sorry, I'm having trouble hearing you. Please call back. Goodbye.",
         "message_taken_fallback": "Got it, thanks -- we'll give you a call back soon!",
-        "switch_keywords": ["english", "inglés", "ingles"],
+        # Spoken when the Anthropic API call itself fails (rate limit, 529,
+        # timeout) -- see the try/except around claude.messages.create above.
+        "temporary_error": "Sorry, I'm having a little trouble on my end -- could you say that one more time?",
+        # See detect_language() for what these three tiers mean and why the
+        # old flat "switch_keywords" list was replaced.
+        "explicit_switch": ["english", "inglés", "ingles"],
+        "strong_signals": [
+            "how much", "what time", "do you", "can you", "i need", "i have",
+            "my phone", "screen", "cracked", "broken", "fix", "repair",
+            "tomorrow", "today", "open", "closed", "thank you", "thanks",
+            "yes", "okay", "please",
+        ],
+        "weak_signals": ["hi", "hello", "hey", "ok", "bye"],
     },
     "es": {
         "name": "Spanish",
@@ -218,23 +230,21 @@ LANGUAGES = {
         "no_catch": "Perdón, no escuché bien -- ¿me lo puede repetir?",
         "no_hearing": "Perdón, tengo problemas para escucharlo. Por favor llame de nuevo. Hasta luego.",
         "message_taken_fallback": "Listo, muchas gracias -- le llamamos pronto.",
-        "switch_keywords": [
-            "español",
-            "espanol",
-            "spanish",
-            "hola",
-            "gracias",
-            "por favor",
-            "cómo",
-            "como esta",
-            "dónde",
-            "cuándo",
-            "ayuda",
-            "reparar",
-            "pantalla",
-            "teléfono",
-            "telefono",
+        "temporary_error": "Perdón, estoy teniendo un pequeño problema -- ¿me lo puede repetir, por favor?",
+        "explicit_switch": ["español", "espanol", "spanish"],
+        # Content words an English speaker essentially never drops into an
+        # otherwise-English sentence. One of these is enough to switch.
+        "strong_signals": [
+            "cuánto", "cuanto", "cuesta", "necesito", "quiero", "tengo",
+            "arreglar", "reparar", "pantalla", "teléfono", "telefono",
+            "celular", "batería", "bateria", "dónde", "donde están",
+            "cuándo", "cuando abren", "está", "estoy", "puede", "puedo",
+            "mi teléfono", "se rompió", "roto", "ayuda", "ayudarme",
+            "buenos días", "buenas tardes", "buenas noches", "mañana",
         ],
+        # Courtesy words English speakers borrow freely ("perfect, gracias!").
+        # These alone are NOT enough -- see detect_language().
+        "weak_signals": ["hola", "gracias", "por favor", "señor", "senor", "sí", "bueno"],
     },
 }
 DEFAULT_LANGUAGE = "en"
@@ -398,13 +408,65 @@ sessions = {}
 
 
 def detect_language(text, current_language):
+    """Decide what language to speak on the next turn.
+
+    Rewritten 2026-09-14 after a QA audit reproduced a real trap: the old
+    version switched on ANY single keyword from a flat list, and that list
+    included "gracias", "hola" and "por favor". A Louisiana caller ending an
+    otherwise fully English call with "perfect, gracias, see you then" was
+    silently flipped into Spanish -- and because the English list only held
+    {"english", "ingles", "inglés"}, nothing they said afterwards in plain
+    English switched them back. They finished the call being answered in a
+    language they had never asked for and could not escape.
+
+    Three tiers now, mirroring the actual strength of each signal:
+
+    1. explicit_switch -- the caller asked in words ("en español por favor",
+       "can we do this in English"). Always honoured immediately, which is
+       the one behaviour the old version got right and this must not lose.
+    2. strong_signals -- content words a speaker of the other language does
+       not casually borrow ("cuánto cuesta", "pantalla", "necesito"). One is
+       enough.
+    3. weak_signals -- courtesy words that cross over constantly ("gracias",
+       "hola", "ok"). Never sufficient alone. They switch only when the whole
+       utterance is essentially that greeting (<= 3 words, e.g. a caller who
+       opens with just "hola" or "hola buenas") AND the utterance carries no
+       competing signal from the language already in use. That last clause
+       matters more than it looks: without it, "ok gracias man" and "thanks,
+       gracias!" are both short enough to trip the rule and reintroduce the
+       exact bug this rewrite exists to remove.
+
+    Net effect: an explicit request still switches instantly, a genuine
+    Spanish speaker still switches on their first real sentence, and a
+    polite English speaker stays in English.
+    """
     lowered = text.lower()
+    word_count = len(lowered.split())
+
+    def hits(cfg, key):
+        return sum(
+            1
+            for phrase in cfg.get(key, [])
+            if re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", lowered)
+        )
+
+    current_cfg = LANGUAGES[current_language]
+    stays_put = hits(current_cfg, "strong_signals") + hits(current_cfg, "weak_signals")
+
     for code, cfg in LANGUAGES.items():
         if code == current_language:
             continue
-        for keyword in cfg["switch_keywords"]:
-            if re.search(r"\b" + re.escape(keyword) + r"\b", lowered):
-                return code
+
+        if hits(cfg, "explicit_switch"):
+            return code
+        if hits(cfg, "strong_signals"):
+            return code
+        weak = hits(cfg, "weak_signals")
+        if weak and word_count <= 3 and not stays_put:
+            return code
+        if weak >= 2 and not stays_put:
+            return code
+
     return current_language
 
 
@@ -596,13 +658,31 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice", f
     # anything. SYSTEM_PROMPT already asks for "a sentence or two"; this
     # makes that a hard ceiling so a longer reply can't add synthesis delay
     # on top of whatever caused the reported silence.
-    response = claude.messages.create(
-        model=MODEL,
-        max_tokens=120,
-        system=system_prompt,
-        tools=tools,
-        messages=history,
-    )
+    #
+    # 2026-09-14 audit finding: this call had no error handling at all -- a
+    # transient Anthropic error (rate limit, 529 overloaded, timeout) would
+    # raise straight out of call_claude(), /gather or /sms would 500, and the
+    # caller got silence or a dropped call instead of any response (exactly
+    # what the failure/fallback review this came from was checking for).
+    # Caught here so one bad turn degrades to a spoken apology instead of a
+    # broken call. A synthetic assistant turn is still appended to history on
+    # failure -- the Messages API requires strictly alternating roles, and
+    # the caller's own turn was already appended above; without this, the
+    # very next turn would also fail, but from malformed history instead of
+    # a real API error, and never recover for the rest of the call.
+    try:
+        response = claude.messages.create(
+            model=MODEL,
+            max_tokens=120,
+            system=system_prompt,
+            tools=tools,
+            messages=history,
+        )
+    except Exception as exc:
+        print(f"call_claude: Anthropic API error: {exc}")
+        spoken = LANGUAGES[session["language"]]["temporary_error"]
+        history.append({"role": "assistant", "content": spoken})
+        return spoken, None
 
     spoken_parts = []
     tool_call = None
@@ -670,16 +750,27 @@ def shop_open_status():
 # alternative is calls dropping before anyone hears anything, that trade is
 # clearly worth it. The real conversation still starts fully AI-driven on the
 # caller's first actual reply, handled in /gather as before.
+# The Spanish offer is spoken IN SPANISH on purpose (fixed 2026-09-14). It
+# used to read "-- and I also speak Spanish, if you prefer" -- in English, to
+# a caller whose whole reason for needing the line is that they may not speak
+# English. A monolingual Spanish speaker heard an English sentence and learned
+# nothing from it, which is the one thing this line exists to prevent.
+# Both other places that make this same offer already say it in Spanish (the
+# SYSTEM_PROMPT's own example and SMS_CHANNEL_NOTE); this fixed greeting was
+# the odd one out, and it is the version every caller actually hears, since it
+# deliberately bypasses Claude. Polly.Matthew reads it with an American accent
+# -- which is exactly how a bilingual employee at the shop would sound, and is
+# plainly understandable, so no voice switch mid-greeting is needed.
 def opening_greeting(is_open, next_open_text):
     if is_open:
         return (
             f"Hey there! This is {AGENT_NAME_SPOKEN_EN} from Twin Wireless. What can I help you with today? "
-            "-- and I also speak Spanish, if you prefer."
+            "También hablo español, si prefiere."
         )
     return (
         f"Hey there! This is {AGENT_NAME_SPOKEN_EN} from Twin Wireless. We're closed right now, back open "
         f"{next_open_text} -- but go ahead and tell me what's going on, I'll do what I can. "
-        "-- and I also speak Spanish, if you prefer."
+        "También hablo español, si prefiere."
     )
 
 
