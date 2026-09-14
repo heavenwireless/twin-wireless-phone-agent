@@ -1,0 +1,31 @@
+# Twin Wireless phone agent — .gitignore
+#
+# Added 2026-09-14. THIS REPO IS PUBLIC and had no .gitignore. The app reads
+# ANTHROPIC_API_KEY, TWILIO_AUTH_TOKEN and OWNER_PHONE from the environment, so
+# a local .env is the obvious way to run it — and there was nothing to stop that
+# file being committed.
+
+# --- credentials ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*token*.json
+*secret*
+credentials*
+
+# --- customer data / PII ----------------------------------------------------
+*.csv
+exports/
+*customer*
+bookings/
+
+# --- runtime noise ----------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.DS_Store
+Thumbs.db
