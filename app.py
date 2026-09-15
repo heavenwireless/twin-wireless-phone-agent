@@ -1692,6 +1692,69 @@ def notify_owner():
         return {"ok": False, "error": str(exc)}, 502
 
 
+@app.route("/messaging-config", methods=["GET"])
+def messaging_config():
+    """Report which sender outbound SMS will actually use. Sends nothing.
+
+    Added so the Messaging Service can be verified BEFORE the one authorised
+    test message, rather than inferred from the result afterwards. Setting
+    TWILIO_MESSAGING_SERVICE_SID to the wrong service, or to one whose sender
+    pool does not contain the registered number, is silent: messages still go
+    out, just not under the approved A2P campaign.
+
+    Read-only against Twilio. Returns the service's friendly name, its sender
+    pool, and whether the A2P-registered number is in it. The SID itself is
+    reported only as a masked prefix -- enough to confirm which service is
+    configured, not enough to paste anywhere it matters.
+    """
+    given = request.headers.get("X-Webhook-Secret", "")
+    accepted = {s for s in (os.environ.get("POS_REVIEW_SECRET", ""), NOTIFY_WEBHOOK_SECRET) if s}
+    if not accepted or given not in accepted:
+        return {"error": "unauthorized"}, 401
+
+    out = {
+        "sends_via": "messaging_service" if TWILIO_MESSAGING_SERVICE_SID else "from_number",
+        "from_number_tail": TWILIO_FROM_NUMBER[-4:] if TWILIO_FROM_NUMBER else None,
+        "messaging_service_configured": bool(TWILIO_MESSAGING_SERVICE_SID),
+    }
+
+    if not TWILIO_MESSAGING_SERVICE_SID:
+        out["note"] = ("No Messaging Service set. Sends use the From number directly, "
+                       "which is outside the approved A2P campaign.")
+        return out
+
+    out["messaging_service_sid_masked"] = (
+        TWILIO_MESSAGING_SERVICE_SID[:6] + "..." + TWILIO_MESSAGING_SERVICE_SID[-4:]
+    )
+    try:
+        svc = twilio_client.messaging.v1.services(TWILIO_MESSAGING_SERVICE_SID).fetch()
+        out["service_name"] = svc.friendly_name
+        out["use_inbound_webhook_on_number"] = svc.use_inbound_webhook_on_number
+    except Exception as exc:
+        out["service_lookup_error"] = str(exc)[:200]
+        out["verified"] = False
+        return out, 502
+
+    try:
+        senders = twilio_client.messaging.v1.services(
+            TWILIO_MESSAGING_SERVICE_SID
+        ).phone_numbers.list(limit=20)
+        tails = [p.phone_number[-4:] for p in senders if p.phone_number]
+        out["sender_pool_count"] = len(senders)
+        out["sender_pool_number_tails"] = tails
+        want = TWILIO_FROM_NUMBER[-4:] if TWILIO_FROM_NUMBER else None
+        out["registered_number_in_pool"] = want in tails
+        out["verified"] = bool(want and want in tails)
+        if not out["verified"]:
+            out["note"] = ("The A2P-registered number is NOT in this service's sender pool. "
+                           "Messages would send from another number in the pool, or fail.")
+    except Exception as exc:
+        out["sender_pool_error"] = str(exc)[:200]
+        out["verified"] = False
+
+    return out
+
+
 @app.route("/send-review-test", methods=["POST"])
 def send_review_test():
     """Send the REAL review message to the owner, and only to the owner.
