@@ -1048,6 +1048,32 @@ def _is_opted_out(phone):
         return True
 
 
+def _has_written_consent(phone):
+    """Prior express WRITTEN consent gate for review/marketing sends.
+
+    Only a record of type "written_electronic" -- created by the customer
+    themselves through https://www.twin-wireless.com/text-opt-in/ -- counts.
+    A staff-recorded verbal yes does not satisfy this gate and never will
+    (REVIEW-SMS-RESTART-PLAN.md section 3).
+
+    FAILS CLOSED in every branch, including missing configuration: unlike
+    _is_opted_out (where unconfigured creds fail open because opt-out data
+    simply doesn't exist yet), absence of proof of consent IS the answer --
+    no proven consent, no send."""
+    normalized = _normalize_phone(phone) or phone
+    if not (ADMIN_API_USER and ADMIN_API_PASS) or not normalized:
+        return False
+    try:
+        data = _admin_api_get("/admin-api/sms-consent.php", params={"phone": normalized})
+        return any(
+            r.get("type") == "written_electronic" and r.get("consent") is True
+            for r in data.get("consents", [])
+        )
+    except Exception as exc:
+        print(f"_has_written_consent: could not verify {normalized}, failing closed: {exc}")
+        return False
+
+
 def _record_opt_out(phone, body):
     """Mark EVERY record for this number opted out, creating a placeholder if
     the number has none. Returns True if the opt-out was persisted somewhere.
@@ -1323,6 +1349,18 @@ def run_followup_cycle():
 
         if record.get("attempts", 0) >= max_retries:
             continue  # already exhausted retries, sitting in Needs Staff Attention
+
+        # Written-consent gate (2026-09-15): this message asks for a review,
+        # which requires prior express written consent. A record stays
+        # pending -- not failed -- until the customer completes the counter
+        # opt-in form; there is nothing to retry and nothing staff can type
+        # on their behalf.
+        if not _has_written_consent(record_phone):
+            print(
+                "Follow-up cycle: skipping appointment "
+                f"{record.get('appointmentId')} -- no written consent on file"
+            )
+            continue
 
         sent_ok, error = _send_followup_sms(appointment, settings)
         appointment_id = record["appointmentId"]
@@ -1839,6 +1877,14 @@ def send_pos_review():
 
     if _is_opted_out(phone):
         return {"ok": False, "skipped": "opted-out"}
+
+    # Prior express written consent, or nothing. This is the gate the whole
+    # 2026-09-15 restart plan hangs on: the registered campaign does not cover
+    # this message today (Twilio ticket #29564371 pending), and even once it
+    # does, only customers who completed the counter opt-in form may be
+    # texted. Fails closed on any API doubt.
+    if not _has_written_consent(phone):
+        return {"ok": False, "skipped": "no-written-consent"}
 
     # Dedupe against the website follow-up ledger. Fail-open on a read error:
     # the caller's ledger already prevents re-sends of ITS records, and
