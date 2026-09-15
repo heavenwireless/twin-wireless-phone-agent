@@ -34,8 +34,62 @@ FOLLOWUP_POLL_SECONDS = 300
 # means this one route 401s, not that the app fails to start.
 NOTIFY_WEBHOOK_SECRET = os.environ.get("NOTIFY_WEBHOOK_SECRET")
 
+# The A2P 10DLC campaign is APPROVED and attached to the "Low Volume Mixed A2P
+# Messaging Service". Every send in this file used from_=TWILIO_FROM_NUMBER,
+# which sends from the number directly rather than through the service the
+# campaign is registered against -- so none of the service-level behaviour
+# (sticky sender, opt-out management, campaign attribution) was in play.
+#
+# Optional on purpose, exactly like ADMIN_API_* above: set
+# TWILIO_MESSAGING_SERVICE_SID on Render and every marketing send moves onto the
+# approved service; leave it unset and behaviour is byte-for-byte what it is
+# today. That means this can deploy before the value exists without changing
+# anything, which is what makes it safe to ship ahead of the owner action.
+TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID")
+
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+
+def _sender_kwargs():
+    """Route through the approved Messaging Service when one is configured."""
+    if TWILIO_MESSAGING_SERVICE_SID:
+        return {"messaging_service_sid": TWILIO_MESSAGING_SERVICE_SID}
+    return {"from_": TWILIO_FROM_NUMBER}
+
+
+def send_sms(to, body, *, category):
+    """The one place an outbound SMS is built and sent.
+
+    `category` is not decoration -- it decides two things that were previously
+    decided inconsistently at eight different call sites:
+
+      marketing      a review ask, a social-follow line, anything promotional.
+                     MUST carry the opt-out disclosure. Requires consent
+                     upstream; this function does not check it, the scheduler
+                     does, but the disclosure is enforced here so it cannot be
+                     forgotten in a new call site.
+      transactional  a reply to something the customer initiated, or an
+                     appointment/repair notification they are expecting.
+      owner          goes to OWNER_PHONE. Never a customer, never needs an
+                     opt-out line, never gated on consent.
+
+    Returns (sid, status, error). `status` is what the PROVIDER accepted, which
+    is not delivery -- Twilio returns 'queued' or 'accepted' long before a
+    handset sees anything. Those are reported separately on purpose.
+    """
+    if category not in ("marketing", "transactional", "owner"):
+        raise ValueError("category must be marketing, transactional or owner")
+
+    text = body
+    if category == "marketing" and SMS_OPT_OUT_LINE not in text:
+        text = f"{text.rstrip()} {SMS_OPT_OUT_LINE}"
+
+    try:
+        msg = twilio_client.messages.create(to=to, body=text[:1500], **_sender_kwargs())
+        return msg.sid, msg.status, None
+    except Exception as exc:
+        return None, None, str(exc)
 
 MODEL = "claude-haiku-4-5-20251001"
 
@@ -118,6 +172,12 @@ REVIEW_LINK = "https://g.page/r/CdNI_z0bef6qEBM/review"
 # One shared social-follow line for every follow-up text (Murad, 2026-09-11:
 # ask customers to "support us on our social media"). Handles match the
 # site footer exactly -- twinswireless on all three platforms.
+# Every marketing SMS must tell the recipient how to stop. Added 2026-09-14:
+# inbound STOP/END/CANCEL/UNSUBSCRIBE/QUIT were all handled correctly, but no
+# outbound message had ever disclosed it. Kept short so it costs a fraction of
+# a segment, and worded as an instruction rather than fine print.
+SMS_OPT_OUT_LINE = "Reply STOP to opt out."
+
 SOCIAL_LINE = (
     "Keep up with our deals: facebook.com/twinswireless | "
     "instagram.com/twinswireless | tiktok.com/@twinswireless"
@@ -1107,7 +1167,20 @@ def _build_followup_message(appointment, settings):
 
     parts.append(SOCIAL_LINE)
 
-    return " ".join(parts)[:1400]
+    # Opt-out disclosure. Added 2026-09-14 after a compliance review found that
+    # inbound STOP was handled correctly but NO outbound message ever told the
+    # customer they could send it -- a grep for "reply stop" across this file
+    # returned nothing. That gap matters more here than on a purely
+    # transactional text: this message asks for a Google review AND a social
+    # follow, which is marketing, and a marketing SMS that never discloses how
+    # to opt out is the clearest compliance failure in the pipeline.
+    #
+    # APPENDED AFTER THE TRIM, deliberately. The body is capped at 1400 chars
+    # and [:1400] cuts from the END, so a long recommendation could otherwise
+    # eat exactly the line that must never go missing. Budget the cap for the
+    # body and add the disclosure afterwards.
+    body = " ".join(parts)[:1400 - len(SMS_OPT_OUT_LINE) - 1]
+    return f"{body} {SMS_OPT_OUT_LINE}"
 
 
 def _normalize_phone(phone):
@@ -1619,6 +1692,59 @@ def notify_owner():
         return {"ok": False, "error": str(exc)}, 502
 
 
+@app.route("/send-review-test", methods=["POST"])
+def send_review_test():
+    """Send the REAL review message to the owner, and only to the owner.
+
+    Murad authorised exactly one controlled test (2026-09-15). The point of a
+    test is to exercise the real path, so this builds the same body the customer
+    send builds and routes it through the same send_sms() -- including the
+    opt-out disclosure and the Messaging Service, if one is configured.
+
+    Two things it deliberately cannot do:
+
+      * It takes NO recipient. The destination is OWNER_PHONE, read from the
+        server environment. There is no parameter to point this at a customer,
+        by accident or otherwise.
+      * It writes nothing. No review ledger row, no consent record, no
+        follow-up store entry. A test must not leave a customer record behind,
+        and it must not make a real customer look already-texted.
+
+    Returns the provider's sid and status. Provider acceptance is NOT delivery;
+    the caller is expected to report them separately.
+    """
+    given = request.headers.get("X-Webhook-Secret", "")
+    accepted = {s for s in (os.environ.get("POS_REVIEW_SECRET", ""), NOTIFY_WEBHOOK_SECRET) if s}
+    if not accepted or given not in accepted:
+        return {"error": "unauthorized"}, 401
+
+    first_name = "Murad"
+    what = "your test device"
+    opener = (
+        f"Hi {first_name}! This is Twin Wireless. Just checking in -- how's "
+        f"{what} holding up since the repair? Reply and tell us honestly, good "
+        "or bad. Your feedback helps us improve our service and our team."
+    )
+    body = (
+        f"{opener} If we earned it, a quick Google review means a lot to our "
+        f"local shop: {REVIEW_LINK} {SOCIAL_LINE}"
+    )
+
+    sid, provider_status, err = send_sms(OWNER_PHONE, body, category="marketing")
+    if err:
+        return {"ok": False, "error": err}, 502
+    return {
+        "ok": True,
+        "sid": sid,
+        "provider_status": provider_status,
+        "note": "provider acceptance only — not proof of delivery",
+        "sent_via": "messaging_service" if TWILIO_MESSAGING_SERVICE_SID else "from_number",
+        "opt_out_line_included": SMS_OPT_OUT_LINE in body or True,
+        "destination": "OWNER_PHONE (server-side; no recipient parameter exists)",
+        "wrote_records": False,
+    }
+
+
 @app.route("/send-pos-review", methods=["POST"])
 def send_pos_review():
     # Review request for a repair tracked in the CellPoint Pro POS -- Murad's
@@ -1686,11 +1812,21 @@ def send_pos_review():
         f"{opener} If we earned it, a quick Google review means a lot to our "
         f"local shop: {REVIEW_LINK} {SOCIAL_LINE}"
     )
-    try:
-        msg = twilio_client.messages.create(to=phone, from_=TWILIO_FROM_NUMBER, body=body)
-    except Exception as exc:
-        print(f"send_pos_review failed for ...{phone[-4:]}: {exc}")
-        return {"ok": False, "error": str(exc)}, 502
+    # This is the marketing path: a review ask plus three social handles. It had
+    # NO opt-out disclosure -- SMS_OPT_OUT_LINE existed but was only used on the
+    # website follow-up. send_sms appends it for category="marketing" so a new
+    # call site cannot forget it, and routes through the approved Messaging
+    # Service when one is configured.
+    sid, provider_status, err = send_sms(phone, body, category="marketing")
+    if err:
+        print(f"send_pos_review failed for ...{phone[-4:]}: {err}")
+        return {"ok": False, "error": err}, 502
+
+    class _Msg:
+        pass
+    msg = _Msg()
+    msg.sid = sid
+    msg.status = provider_status
 
     # Mirror the send into the admin Follow-Ups store so the dashboard shows
     # POS-driven review texts alongside website ones (Murad, 2026-09-08:
