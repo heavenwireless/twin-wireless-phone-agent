@@ -51,6 +51,23 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
+# Review-request SMS pause (2026-09-15). The approved 10DLC campaign enumerates
+# exactly two customer message types -- a callback confirmation and the
+# lease-to-own financing link -- and a Google review link is neither. The 4PM
+# POS job and the website follow-up cycle were both paused on 2026-09-14 for
+# that reason, but the phone agent's own review-link tool was missed: it could
+# still offer and text a review link on any live call. Twilio's own message
+# logs confirm it never fired (every outbound after 2026-09-14 17:02 CDT went
+# to OWNER_PHONE), so this closed a live gap rather than an observed incident.
+#
+# Defined here, above send_sms, because send_sms is the server-side chokepoint
+# that enforces it for every route -- see the `review` category there.
+#
+# Defaults to PAUSED, so a missing or empty env var fails safe. Flip to "0" in
+# Render to resume once Twilio answers ticket #29564371 -- no code change.
+REVIEW_SMS_PAUSED = os.environ.get("REVIEW_SMS_PAUSED", "1").strip().lower() not in ("0", "false", "no")
+
+
 def _sender_kwargs():
     """Route through the approved Messaging Service when one is configured."""
     if TWILIO_MESSAGING_SERVICE_SID:
@@ -58,31 +75,51 @@ def _sender_kwargs():
     return {"from_": TWILIO_FROM_NUMBER}
 
 
-def send_sms(to, body, *, category):
+class ReviewSmsPaused(Exception):
+    """Raised when a review-category send is attempted while paused."""
+
+
+def send_sms(to, body, *, category, owner_test_override=False):
     """The one place an outbound SMS is built and sent.
 
-    `category` is not decoration -- it decides two things that were previously
+    `category` is not decoration -- it decides three things that were previously
     decided inconsistently at eight different call sites:
 
-      marketing      a review ask, a social-follow line, anything promotional.
-                     MUST carry the opt-out disclosure. Requires consent
-                     upstream; this function does not check it, the scheduler
-                     does, but the disclosure is enforced here so it cannot be
-                     forgotten in a new call site.
+      review         a Google review request, by any route: the POS scheduler,
+                     the website follow-up cycle, or the phone agent's own
+                     tool. Carries the opt-out disclosure like marketing, AND
+                     is refused outright while REVIEW_SMS_PAUSED. This is the
+                     server-side chokepoint: withholding the tool from the
+                     model stops the model, but not a direct POST to
+                     /send-pos-review, a stale queued job, or a call site added
+                     next month. Refusing here stops all of them.
+      marketing      a social-follow line or other promotional content that is
+                     not a review ask. MUST carry the opt-out disclosure.
       transactional  a reply to something the customer initiated, or an
                      appointment/repair notification they are expecting.
       owner          goes to OWNER_PHONE. Never a customer, never needs an
                      opt-out line, never gated on consent.
 
+    `owner_test_override` releases the review pause for ONE purpose: Murad's
+    single authorized test to his own phone. It is honoured only when the
+    destination is literally OWNER_PHONE, so it can never be pointed at a
+    customer even if a future call site passes it by mistake.
+
     Returns (sid, status, error). `status` is what the PROVIDER accepted, which
     is not delivery -- Twilio returns 'queued' or 'accepted' long before a
     handset sees anything. Those are reported separately on purpose.
     """
-    if category not in ("marketing", "transactional", "owner"):
-        raise ValueError("category must be marketing, transactional or owner")
+    if category not in ("review", "marketing", "transactional", "owner"):
+        raise ValueError("category must be review, marketing, transactional or owner")
+
+    if category == "review" and REVIEW_SMS_PAUSED:
+        if not (owner_test_override and _normalize_phone(to) == _normalize_phone(OWNER_PHONE)):
+            print(f"send_sms: REFUSED review send to ...{str(to)[-4:]} -- REVIEW_SMS_PAUSED is on")
+            return None, None, "review SMS is paused (REVIEW_SMS_PAUSED)"
+        print("send_sms: review pause released for the authorized owner test")
 
     text = body
-    if category == "marketing" and SMS_OPT_OUT_LINE not in text:
+    if category in ("review", "marketing") and SMS_OPT_OUT_LINE not in text:
         text = f"{text.rstrip()} {SMS_OPT_OUT_LINE}"
 
     try:
@@ -316,19 +353,6 @@ AGENT_NAME = "Khaled"
 # Claude's own replies are handled (see the MULTI-LANGUAGE pronunciation note
 # in SYSTEM_PROMPT for the Spanish equivalent, "Jaled").
 AGENT_NAME_SPOKEN_EN = "Kha-led"
-
-# Review-request SMS pause (2026-09-15). The approved 10DLC campaign enumerates
-# exactly two customer message types -- a callback confirmation and the
-# lease-to-own financing link -- and a Google review link is neither. The 4PM
-# POS job and the website follow-up cycle were both paused on 2026-09-14 for
-# that reason, but THIS path was missed: the phone agent could still offer and
-# text a review link on any live call. Twilio's own message logs confirm it has
-# not fired since the pause (every outbound after 2026-09-14 17:02 CDT went to
-# OWNER_PHONE), so this closes a live gap rather than an observed incident.
-#
-# Defaults to PAUSED, so a missing env var fails safe. Flip to "0" in Render to
-# resume once Twilio answers ticket #29564371 -- no code change needed.
-REVIEW_SMS_PAUSED = os.environ.get("REVIEW_SMS_PAUSED", "1").strip().lower() not in ("0", "false", "no")
 
 # When paused the agent is never told the review ask exists, rather than being
 # told to offer something the tool layer will silently refuse -- that would have
@@ -873,12 +897,11 @@ def send_message_sms(args):
         f"Category: {args.get('category')}\n"
         f"Summary: {args.get('summary')}"
     )
-    try:
-        twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body)
-    except Exception as exc:
-        # Never let an SMS failure (e.g. A2P 10DLC/Trust Hub not approved yet) take
-        # down the call -- log it and keep going.
-        print(f"send_message_sms failed: {exc}")
+    # Never let an SMS failure (e.g. A2P 10DLC/Trust Hub not approved yet) take
+    # down the call -- log it and keep going.
+    _sid, _status, err = send_sms(OWNER_PHONE, body, category="owner")
+    if err:
+        print(f"send_message_sms failed: {err}")
 
 
 def send_financing_link_sms(args, caller_number):
@@ -886,10 +909,15 @@ def send_financing_link_sms(args, caller_number):
         return
     name, link = FINANCING_LINKS.get(args.get("option"), FINANCING_LINKS["acima"])
     body = f"Twin Wireless financing -- {name}: {link}"
-    try:
-        twilio_client.messages.create(to=caller_number, from_=TWILIO_FROM_NUMBER, body=body)
-    except Exception as exc:
-        print(f"send_financing_link_sms failed: {exc}")
+    # Transactional and explicitly covered by the registered campaign ("if a
+    # caller verbally asks during the call for ... our lease-to-own financing
+    # application, we text that single item to the number they called from").
+    # Unaffected by the review pause; routed through send_sms only so it uses
+    # the approved Messaging Service. No opt-out line is appended to a
+    # transactional message the caller just asked for.
+    _sid, _status, err = send_sms(caller_number, body, category="transactional")
+    if err:
+        print(f"send_financing_link_sms failed: {err}")
 
 
 def send_review_link_sms(caller_number):
@@ -916,10 +944,10 @@ def send_review_link_sms(caller_number):
         print(f"send_review_link_sms: skipped, number opted out ({caller_number[-4:]})")
         return
     body = f"Thanks for calling Twin Wireless! Mind leaving us a quick review? {REVIEW_LINK}"
-    # Routed through send_sms so it uses the approved Messaging Service and
-    # carries the opt-out disclosure, like every other review-category send.
-    # It had been calling twilio_client directly, bypassing both.
-    sid, _status, err = send_sms(caller_number, body, category="marketing")
+    # Routed through send_sms so it uses the approved Messaging Service, carries
+    # the opt-out disclosure, and passes the server-side review pause. It had
+    # been calling twilio_client directly, bypassing all three.
+    sid, _status, err = send_sms(caller_number, body, category="review")
     if err:
         print(f"send_review_link_sms failed: {err}")
 
@@ -931,10 +959,9 @@ def send_callback_request_sms(reason, phone, appointment_id):
         f"Appointment: {appointment_id}\n"
         f"Reason: {reason}"
     )
-    try:
-        twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body)
-    except Exception as exc:
-        print(f"send_callback_request_sms failed: {exc}")
+    _sid, _status, err = send_sms(OWNER_PHONE, body, category="owner")
+    if err:
+        print(f"send_callback_request_sms failed: {err}")
 
 
 # ---------------------------------------------------------------------------
@@ -1267,11 +1294,14 @@ def _send_followup_sms(appointment, settings):
     if not phone:
         return False, f"appointment has no usable phone number: {appointment.get('phone')!r}"
     body = _build_followup_message(appointment, settings)
-    try:
-        twilio_client.messages.create(to=phone, from_=TWILIO_FROM_NUMBER, body=body)
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
+    # Was calling twilio_client directly with from_=TWILIO_FROM_NUMBER, which
+    # bypassed the approved Messaging Service, the opt-out disclosure, and (once
+    # it existed) the review pause. This message asks for a Google review, so it
+    # is category="review" and is refused server-side while paused.
+    sid, _status, err = send_sms(phone, body, category="review")
+    if err:
+        return False, err
+    return True, None
 
 
 def run_followup_cycle():
@@ -1733,12 +1763,11 @@ def notify_new_appointment():
         f"{date} at {time_}\n"
         f"{repair_summary}"
     )
-    try:
-        twilio_client.messages.create(to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=body[:1500])
-        return {"ok": True}
-    except Exception as exc:
-        print(f"notify_new_appointment failed: {exc}")
-        return {"ok": False, "error": str(exc)}, 502
+    _sid, _status, err = send_sms(OWNER_PHONE, body, category="owner")
+    if err:
+        print(f"notify_new_appointment failed: {err}")
+        return {"ok": False, "error": err}, 502
+    return {"ok": True}
 
 
 @app.route("/notify-owner", methods=["POST"])
@@ -1761,10 +1790,10 @@ def notify_owner():
     try:
         # Twilio hard-caps a message body at 1600 chars; captions fit well
         # under that, and anything longer is trimmed rather than erroring.
-        msg = twilio_client.messages.create(
-            to=OWNER_PHONE, from_=TWILIO_FROM_NUMBER, body=text[:1500]
-        )
-        return {"ok": True, "sid": msg.sid}
+        sid, _status, err = send_sms(OWNER_PHONE, text, category="owner")
+        if err:
+            raise RuntimeError(err)
+        return {"ok": True, "sid": sid}
     except Exception as exc:
         print(f"notify_owner failed: {exc}")
         return {"ok": False, "error": str(exc)}, 502
@@ -1859,28 +1888,37 @@ def send_review_test():
     if not accepted or given not in accepted:
         return {"error": "unauthorized"}, 401
 
-    first_name = "Murad"
-    what = "your test device"
-    opener = (
-        f"Hi {first_name}! This is Twin Wireless. Just checking in -- how's "
-        f"{what} holding up since the repair? Reply and tell us honestly, good "
-        "or bad. Your feedback helps us improve our service and our team."
-    )
+    # The REVIEW-ONLY wording submitted to Twilio on ticket #29564371, not the
+    # old promotional body. Murad, 2026-09-15: "Do not include social-follow
+    # promotions in the proposed review-only message." A test of a workflow we
+    # have not proposed would prove nothing about the workflow we have.
     body = (
-        f"{opener} If we earned it, a quick Google review means a lot to our "
-        f"local shop: {REVIEW_LINK} {SOCIAL_LINE}"
+        "Hi Murad, this is Twin Wireless on Line Ave. Your test device repair is "
+        "done -- how's it holding up? Reply and tell us honestly, good or bad. "
+        f"If you'd rather leave it as a Google review: {REVIEW_LINK}"
     )
 
-    sid, provider_status, err = send_sms(OWNER_PHONE, body, category="marketing")
+    # category="review" so this exercises the real gated path. The override is
+    # the ONLY way past the pause, and send_sms honours it solely because the
+    # destination is OWNER_PHONE.
+    sid, provider_status, err = send_sms(
+        OWNER_PHONE, body, category="review", owner_test_override=True
+    )
     if err:
         return {"ok": False, "error": err}, 502
+    # send_sms appends the opt-out line after this function built `body`, so
+    # report what was actually required rather than re-checking a stale copy.
+    # (This previously read `SMS_OPT_OUT_LINE in body or True` -- always True,
+    # which would have reported compliance it had not verified.)
     return {
         "ok": True,
         "sid": sid,
         "provider_status": provider_status,
         "note": "provider acceptance only — not proof of delivery",
         "sent_via": "messaging_service" if TWILIO_MESSAGING_SERVICE_SID else "from_number",
-        "opt_out_line_included": SMS_OPT_OUT_LINE in body or True,
+        "opt_out_line_enforced_by": "send_sms(category='review')",
+        "review_pause_bypassed_via": "owner_test_override (OWNER_PHONE only)",
+        "social_follow_line_included": False,
         "destination": "OWNER_PHONE (server-side; no recipient parameter exists)",
         "wrote_records": False,
     }
@@ -1926,6 +1964,13 @@ def send_pos_review():
     if not _has_written_consent(phone):
         return {"ok": False, "skipped": "no-written-consent"}
 
+    # Server-side review pause, checked before any work. send_sms would refuse
+    # this anyway, but returning here means a paused POS run does no ledger
+    # lookups and records no attempt -- a direct POST to this endpoint while
+    # paused is a clean no-op, not a half-executed send.
+    if REVIEW_SMS_PAUSED:
+        return {"ok": False, "skipped": "review-sms-paused"}
+
     # Dedupe against the website follow-up ledger. Fail-open on a read error:
     # the caller's ledger already prevents re-sends of ITS records, and
     # blocking every POS review because the website API hiccuped is the worse
@@ -1966,7 +2011,7 @@ def send_pos_review():
     # website follow-up. send_sms appends it for category="marketing" so a new
     # call site cannot forget it, and routes through the approved Messaging
     # Service when one is configured.
-    sid, provider_status, err = send_sms(phone, body, category="marketing")
+    sid, provider_status, err = send_sms(phone, body, category="review")
     if err:
         print(f"send_pos_review failed for ...{phone[-4:]}: {err}")
         return {"ok": False, "error": err}, 502
