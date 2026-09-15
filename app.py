@@ -317,6 +317,38 @@ AGENT_NAME = "Khaled"
 # in SYSTEM_PROMPT for the Spanish equivalent, "Jaled").
 AGENT_NAME_SPOKEN_EN = "Kha-led"
 
+# Review-request SMS pause (2026-09-15). The approved 10DLC campaign enumerates
+# exactly two customer message types -- a callback confirmation and the
+# lease-to-own financing link -- and a Google review link is neither. The 4PM
+# POS job and the website follow-up cycle were both paused on 2026-09-14 for
+# that reason, but THIS path was missed: the phone agent could still offer and
+# text a review link on any live call. Twilio's own message logs confirm it has
+# not fired since the pause (every outbound after 2026-09-14 17:02 CDT went to
+# OWNER_PHONE), so this closes a live gap rather than an observed incident.
+#
+# Defaults to PAUSED, so a missing env var fails safe. Flip to "0" in Render to
+# resume once Twilio answers ticket #29564371 -- no code change needed.
+REVIEW_SMS_PAUSED = os.environ.get("REVIEW_SMS_PAUSED", "1").strip().lower() not in ("0", "false", "no")
+
+# When paused the agent is never told the review ask exists, rather than being
+# told to offer something the tool layer will silently refuse -- that would have
+# it promise a caller a text that never arrives.
+_REVIEW_ASK_PARAGRAPH = """
+ASKING FOR A REVIEW: Only if the caller's own question was fully and directly answered by
+you in this call (never after taking a message -- that means it's still unresolved, and
+never if the caller seemed frustrated, upset, or in a hurry), you can ask once, casually,
+right before saying goodbye -- something like "Hey, if that was helpful, would you mind
+leaving us a quick Google review? I can text you the link right now." If they say yes, use
+the send_review_link tool (no input needed, it texts the caller's own number), say a quick
+thanks, then continue to end_call on your next turn. If they decline or don't respond
+positively, drop it immediately and just say goodbye -- never ask twice or push.
+""" if not REVIEW_SMS_PAUSED else """
+ASKING FOR A REVIEW: Do not ask callers for a review and do not offer to text them a review
+link -- that is paused right now. If a caller brings up leaving a review themselves, thank
+them warmly and tell them there is a QR code on the counter at the shop. Never offer to
+send it by text.
+"""
+
 SYSTEM_PROMPT = f"""You are {AGENT_NAME}, the phone assistant for Twin Wireless, a device
 repair shop at 2328 Line Ave, Shreveport, LA 71104, phone (318) 670-3938, website
 twin-wireless.com.
@@ -440,16 +472,7 @@ OTHER SERVICES (not repairs -- you can talk about these too, they're not out of 
   text them the application link right then -- use the send_link tool with whichever option
   they want. If they're not sure which one, ask, or default to Acima as the most common pick.
   The link goes to the number they're calling from, so you don't need to ask for a number.
-
-ASKING FOR A REVIEW: Only if the caller's own question was fully and directly answered by
-you in this call (never after taking a message -- that means it's still unresolved, and
-never if the caller seemed frustrated, upset, or in a hurry), you can ask once, casually,
-right before saying goodbye -- something like "Hey, if that was helpful, would you mind
-leaving us a quick Google review? I can text you the link right now." If they say yes, use
-the send_review_link tool (no input needed, it texts the caller's own number), say a quick
-thanks, then continue to end_call on your next turn. If they decline or don't respond
-positively, drop it immediately and just say goodbye -- never ask twice or push.
-
+{_REVIEW_ASK_PARAGRAPH}
 WHEN TO TAKE A MESSAGE (use the take_message tool): the caller doesn't want to come in for a
 free diagnosis and needs a callback instead, a repair status check, the caller wants to speak
 to a person, the caller seems upset, or anything else you can't confidently resolve yourself.
@@ -674,6 +697,14 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice", f
                     "required": ["option"],
                 },
             },
+    ]
+
+    # Review-link tool only exists while review SMS is unpaused. Withholding the
+    # tool (not just the prompt paragraph) is what makes the pause real: an
+    # instruction can be talked around by a persistent caller, a missing tool
+    # cannot be called at all.
+    if not REVIEW_SMS_PAUSED:
+        tools.append(
             {
                 "name": "send_review_link",
                 "description": (
@@ -683,8 +714,8 @@ def call_claude(call_sid, user_text, is_open, next_open_text, channel="voice", f
                     "afterward."
                 ),
                 "input_schema": {"type": "object", "properties": {}},
-            },
-    ]
+            }
+        )
 
     if followup_reply:
         tools.append(
@@ -874,14 +905,23 @@ def send_review_link_sms(caller_number):
     # explicitly scopes the opt-out to follow-up texts and invites them to text
     # again. A review request is exactly what they opted out of; an answer to
     # their own question is not.
+    # Belt to the tool layer's braces. The tool is withheld from Claude while
+    # paused, so nothing should reach here -- but this function is called from
+    # two dispatch sites (/gather and /sms) and a future third would otherwise
+    # reopen the hole silently.
+    if REVIEW_SMS_PAUSED:
+        print("send_review_link_sms: refused, review SMS is paused (REVIEW_SMS_PAUSED)")
+        return
     if _is_opted_out(caller_number):
         print(f"send_review_link_sms: skipped, number opted out ({caller_number[-4:]})")
         return
     body = f"Thanks for calling Twin Wireless! Mind leaving us a quick review? {REVIEW_LINK}"
-    try:
-        twilio_client.messages.create(to=caller_number, from_=TWILIO_FROM_NUMBER, body=body)
-    except Exception as exc:
-        print(f"send_review_link_sms failed: {exc}")
+    # Routed through send_sms so it uses the approved Messaging Service and
+    # carries the opt-out disclosure, like every other review-category send.
+    # It had been calling twilio_client directly, bypassing both.
+    sid, _status, err = send_sms(caller_number, body, category="marketing")
+    if err:
+        print(f"send_review_link_sms failed: {err}")
 
 
 def send_callback_request_sms(reason, phone, appointment_id):
