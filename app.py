@@ -1961,15 +1961,17 @@ def send_pos_review():
     # this message today (Twilio ticket #29564371 pending), and even once it
     # does, only customers who completed the counter opt-in form may be
     # texted. Fails closed on any API doubt.
-    if not _has_written_consent(phone):
-        return {"ok": False, "skipped": "no-written-consent"}
-
-    # Server-side review pause, checked before any work. send_sms would refuse
-    # this anyway, but returning here means a paused POS run does no ledger
-    # lookups and records no attempt -- a direct POST to this endpoint while
-    # paused is a clean no-op, not a half-executed send.
+    # Server-side review pause FIRST -- it is the broadest gate, so a paused
+    # run does no consent lookups, no ledger reads, and records no attempt. A
+    # direct POST to this endpoint while paused is a clean no-op rather than a
+    # half-executed send. Ordering it ahead of the consent check also makes the
+    # pause independently provable in production: hitting this endpoint returns
+    # "review-sms-paused" rather than masking it behind a consent failure.
     if REVIEW_SMS_PAUSED:
         return {"ok": False, "skipped": "review-sms-paused"}
+
+    if not _has_written_consent(phone):
+        return {"ok": False, "skipped": "no-written-consent"}
 
     # Dedupe against the website follow-up ledger. Fail-open on a read error:
     # the caller's ledger already prevents re-sends of ITS records, and
