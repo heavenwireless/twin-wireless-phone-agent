@@ -67,6 +67,23 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 # Render to resume once Twilio answers ticket #29564371 -- no code change.
 REVIEW_SMS_PAUSED = os.environ.get("REVIEW_SMS_PAUSED", "1").strip().lower() not in ("0", "false", "no")
 
+# Whether a review send additionally requires a stored prior-express-WRITTEN
+# consent record (_has_written_consent). Added 2026-09-15; before that commit
+# the POS-sourced sender texted any completed repair, which is the behaviour
+# Murad asked for again on 2026-09-16 ("restore it to the previous edition
+# where it was working and sending").
+#
+# This is a switch, not a deletion. The gate and its tests stay in the code, so
+# turning the requirement back on is one env var and no deploy. It is also
+# visible in the Render dashboard, which a removed `if` would not be.
+#
+# Defaults to REQUIRED, so an unset var is the safe reading. Setting it to "0"
+# is a deliberate, logged owner decision -- see the startup banner below and
+# REVIEW-SMS-RESTART-PLAN.md.
+REVIEW_REQUIRE_WRITTEN_CONSENT = os.environ.get(
+    "REVIEW_REQUIRE_WRITTEN_CONSENT", "1"
+).strip().lower() not in ("0", "false", "no")
+
 
 def _sender_kwargs():
     """Route through the approved Messaging Service when one is configured."""
@@ -1696,7 +1713,7 @@ def run_followup_cycle():
         # pending -- not failed -- until the customer completes the counter
         # opt-in form; there is nothing to retry and nothing staff can type
         # on their behalf.
-        if not _has_written_consent(record_phone):
+        if REVIEW_REQUIRE_WRITTEN_CONSENT and not _has_written_consent(record_phone):
             print(
                 "Follow-up cycle: skipping appointment "
                 f"{record.get('appointmentId')} -- no written consent on file"
@@ -2268,7 +2285,7 @@ def send_pos_review():
     if REVIEW_SMS_PAUSED:
         return {"ok": False, "skipped": "review-sms-paused"}
 
-    if not _has_written_consent(phone):
+    if REVIEW_REQUIRE_WRITTEN_CONSENT and not _has_written_consent(phone):
         return {"ok": False, "skipped": "no-written-consent"}
 
     # Same two guards the website cycle applies, for the same reasons: no
@@ -2426,3 +2443,18 @@ try:
     scheduler.start()
 except Exception as exc:
     print(f"Follow-up agent: scheduler failed to start: {exc}")
+
+# State of the two review-SMS gates, printed once per deploy. A relaxed gate
+# that is only visible as an absent env var is easy to forget; this puts it in
+# the log where anyone reading a deploy can see what is live.
+print(
+    "Review SMS gates: "
+    f"pause={'ON (nothing sends)' if REVIEW_SMS_PAUSED else 'OFF (sending)'}, "
+    f"written-consent-required={'YES' if REVIEW_REQUIRE_WRITTEN_CONSENT else 'NO -- owner override'}"
+)
+if not REVIEW_SMS_PAUSED and not REVIEW_REQUIRE_WRITTEN_CONSENT:
+    print(
+        "Review SMS: sending WITHOUT a written-consent record, by owner instruction "
+        "(2026-09-16). Opt-out suppression, one-per-repair dedupe, the backlog "
+        "cutoff and the quiet window all remain enforced."
+    )
