@@ -303,5 +303,140 @@ check("owner test sends", sid == "SMtest", f"got {sid=} {err=}")
 check("no claim written", LEDGER == {}, f"got {LEDGER}")
 check("no dedupe_key needed for the owner test", err is None)
 
-print(f"\nRESULT: {PASS} passed, {FAIL} failed\n")
+
+
+# ===========================================================================
+# 10-13: Murad's 2026-09-16 confirmations, each as a behavioural assertion
+# rather than a claim about the code.
+# ===========================================================================
+
+print("\n10. dedupe is per REPAIR, not a permanent block on the person")
+reset()
+# Historical send, exactly as the seeder records it: this repair is done.
+LEDGER["pos-900"] = {"key": "pos-900", "phone": CUSTOMER, "status": "sent",
+                     "claimedAt": long_ago, "sentAt": long_ago}
+sid, _, err = app.send_sms(CUSTOMER, "again", category="review", dedupe_key="pos-900")
+check("the SAME repair stays blocked forever", sid is None, f"got {sid=}")
+# A different repair for the same person, long after the quiet window.
+sid, _, err = app.send_sms(CUSTOMER, "new repair", category="review", dedupe_key="pos-901")
+check("a LATER separate repair is NOT blocked", sid == "SMtest", f"got {sid=} {err=}")
+check("both repairs now in the ledger", set(LEDGER) == {"pos-900", "pos-901"}, f"got {set(LEDGER)}")
+
+print("\n11. the quiet window is time-bounded and switchable, never permanent")
+reset()
+LEDGER["pos-910"] = {"key": "pos-910", "phone": CUSTOMER, "status": "sent",
+                     "claimedAt": recently, "sentAt": recently}
+check("a send 2 days ago blocks within a 30-day window",
+      app._recently_sent_review(CUSTOMER, {"reviewQuietDays": 30}) is True)
+check("the same send does NOT block a 1-day window",
+      app._recently_sent_review(CUSTOMER, {"reviewQuietDays": 1}) is False)
+check("reviewQuietDays=0 disables it entirely",
+      app._recently_sent_review(CUSTOMER, {"reviewQuietDays": 0}) is False)
+LEDGER.clear()
+LEDGER["pos-911"] = {"key": "pos-911", "phone": CUSTOMER, "status": "sent",
+                     "claimedAt": long_ago, "sentAt": long_ago}
+check("a 60-day-old send does not block a 30-day window",
+      app._recently_sent_review(CUSTOMER, {"reviewQuietDays": 30}) is False)
+
+print("\n12. no-show / unfinished / opted-out / already-messaged stay excluded")
+
+
+def cycle_with(appointments, followups, consent=True, quiet=0):
+    """Run the real run_followup_cycle against fixed data. Returns what was sent."""
+    SENT.clear()
+    patched = []
+
+    def fake_get(path, params=None):
+        if path.endswith("site-settings.php"):
+            return {"followUps": {"enabled": True, "delayHours": 0,
+                                  "sendingHoursStart": 0, "sendingHoursEnd": 24,
+                                  "reviewQuietDays": quiet, "reviewMaxAgeDays": 3650}}
+        if path.endswith("appointments.php"):
+            return {"appointments": appointments}
+        if path.endswith("followups.php"):
+            return {"followups": followups}
+        if path.endswith("sms-consent.php"):
+            return {"consents": [{"type": "written_electronic", "consent": True}] if consent else []}
+        if path.endswith("review-sends.php"):
+            phone = (params or {}).get("phone")
+            return {"records": {k: v for k, v in LEDGER.items() if v["phone"] == phone}}
+        raise AssertionError(f"unexpected GET {path}")
+
+    app._admin_api_get = fake_get
+    app._admin_api_post = lambda path, payload: (
+        _fake_post(path, payload) if path.endswith("review-sends.php")
+        else patched.append(payload) or {"ok": True})
+    app._admin_api_patch = lambda path, payload: (
+        _fake_patch(path, payload) if path.endswith("review-sends.php")
+        else patched.append(payload) or {"ok": True})
+    app.run_followup_cycle()
+    app._admin_api_get, app._admin_api_post, app._admin_api_patch = _fake_get, _fake_post, _fake_patch
+    return list(SENT)
+
+
+base_appt = {"phone": "3185550142", "firstName": "Test", "fulfilledAt": recently}
+
+reset()
+sent = cycle_with(
+    [dict(base_appt, id="A1", status="Fulfilled")],
+    [{"appointmentId": "A1", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "pending"}])
+check("a fulfilled, consented, unsent repair DOES send", len(sent) == 1, f"got {len(sent)}")
+
+reset()
+sent = cycle_with(
+    [dict(base_appt, id="A2", status="No Show")],
+    [{"appointmentId": "A2", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "pending"}])
+check("a NO SHOW sends nothing", sent == [], f"got {sent}")
+
+reset()
+sent = cycle_with(
+    [dict(base_appt, id="A3", status="In Progress")],
+    [{"appointmentId": "A3", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "pending"}])
+check("an UNFINISHED repair sends nothing", sent == [], f"got {sent}")
+
+reset()
+sent = cycle_with(
+    [dict(base_appt, id="A4", status="Fulfilled")],
+    [{"appointmentId": "A4", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "pending", "optedOut": True}])
+check("an OPTED-OUT customer sends nothing", sent == [], f"got {sent}")
+
+reset()
+sent = cycle_with(
+    [dict(base_appt, id="A5", status="Fulfilled")],
+    [{"appointmentId": "A5", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "sent"}])
+check("an ALREADY-MESSAGED record sends nothing", sent == [], f"got {sent}")
+
+reset()
+LEDGER["appt-A6"] = {"key": "appt-A6", "phone": CUSTOMER, "status": "sent",
+                     "claimedAt": recently, "sentAt": recently}
+sent = cycle_with(
+    [dict(base_appt, id="A6", status="Fulfilled")],
+    [{"appointmentId": "A6", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "pending"}])
+check("a record the LEDGER already claims sends nothing", sent == [], f"got {sent}")
+
+reset()
+sent = cycle_with(
+    [dict(base_appt, id="A7", status="Fulfilled")],
+    [{"appointmentId": "A7", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "pending"}],
+    consent=False)
+check("NO CONSENT sends nothing", sent == [], f"got {sent}")
+
+print("\n13. an opt-out on one repair protects the person on every other")
+reset()
+sent = cycle_with(
+    [dict(base_appt, id="B1", status="Fulfilled"), dict(base_appt, id="B2", status="Fulfilled")],
+    [{"appointmentId": "B1", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "sent", "optedOut": True},
+     {"appointmentId": "B2", "phone": CUSTOMER, "fulfilledAt": recently,
+      "followupScheduledAt": long_ago, "followUpStatus": "pending"}])
+check("a second repair for an opted-out number sends nothing", sent == [], f"got {sent}")
+
+print(f"\nFINAL: {PASS} passed, {FAIL} failed\n")
 sys.exit(1 if FAIL else 0)

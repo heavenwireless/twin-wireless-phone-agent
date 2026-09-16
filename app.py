@@ -1073,7 +1073,7 @@ def send_review_link_sms(caller_number):
     # still a review link arriving from the same number, and Murad's rule is one
     # review request per completed repair -- so if this number was already sent
     # the automated one recently, this stays quiet rather than making it two.
-    if _recently_sent_review(caller_number):
+    if _recently_sent_review(caller_number, get_followup_settings()):
         print(f"send_review_link_sms: skipped, ...{caller_number[-4:]} already got a review text recently")
         return
 
@@ -1255,19 +1255,40 @@ def _is_opted_out(phone):
         return True
 
 
-REVIEW_QUIET_DAYS = 45
+REVIEW_QUIET_DAYS_DEFAULT = 30
 
 
-def _recently_sent_review(phone):
+def _recently_sent_review(phone, settings=None):
     """Has this number had ANY review text from us inside the quiet window?
 
-    Guards the cross-path case the per-repair key cannot: the same person,
-    two different repair ids. The per-repair claim is what stops a repair being
-    texted twice; this is what stops a customer being asked three times in a
-    fortnight because they brought in three devices.
+    WHAT DEDUPLICATION IS AND IS NOT, because these are two different things.
+
+    The PRIMARY guard is the per-repair claim in the review-sends ledger, keyed
+    `appt-<id>` / `pos-<id>` / `pos-inv-<id>`. That is what "one review request
+    per completed repair" means, and it is permanent: a repair that has been
+    texted about is never texted about again. It is ALSO why a customer is not
+    blocked forever -- a future separate repair is a different id, a different
+    key, and a fresh claim. The 21 historical sends seeded into the ledger
+    block those 21 repairs, not those 21 people.
+
+    This function is a SECONDARY, TIME-BOUNDED guard on top, and it is the only
+    thing here that can delay a future separate repair. Without it a customer
+    who brings in three devices on one afternoon gets three review texts, which
+    is not what one-per-repair was meant to produce. With it they get one, and
+    the next genuine repair after the window qualifies normally.
+
+    Murad, 2026-09-16: deduplication must not mean "permanently blocking a
+    customer from a review request after a future separate repair." So the
+    window is days, not forever, and it is configurable -- set
+    followUps.reviewQuietDays to 0 to switch it off entirely and rely purely on
+    the per-repair key.
 
     FAILS CLOSED on a ledger error, same reasoning as the claim itself.
     """
+    quiet_days = int((settings or {}).get("reviewQuietDays", REVIEW_QUIET_DAYS_DEFAULT) or 0)
+    if quiet_days <= 0:
+        return False   # explicitly disabled; the per-repair claim still applies
+
     normalized = _normalize_phone(phone) or phone
     if not (ADMIN_API_USER and ADMIN_API_PASS) or not normalized:
         return False
@@ -1277,7 +1298,7 @@ def _recently_sent_review(phone):
         print(f"_recently_sent_review: ledger unreachable for {normalized}, failing closed: {exc}")
         return True
 
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=REVIEW_QUIET_DAYS)
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=quiet_days)
     for record in (data.get("records") or {}).values():
         if record.get("status") != "sent":
             continue
@@ -1697,7 +1718,7 @@ def run_followup_cycle():
             )
             continue
 
-        if _recently_sent_review(record_phone):
+        if _recently_sent_review(record_phone, settings):
             print(
                 "Follow-up cycle: skipping appointment "
                 f"{record.get('appointmentId')} -- this number had a review text recently"
@@ -2258,7 +2279,7 @@ def send_pos_review():
     if _is_backlog((data.get("completedAt") or "").strip(), get_followup_settings()):
         return {"ok": False, "skipped": "backlog-cutoff"}
 
-    if _recently_sent_review(phone):
+    if _recently_sent_review(phone, get_followup_settings()):
         return {"ok": False, "skipped": "recent-review-text"}
 
     # Dedupe against the website follow-up ledger. Fail-open on a read error:
