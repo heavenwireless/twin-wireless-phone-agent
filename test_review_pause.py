@@ -64,6 +64,29 @@ _bg.BackgroundScheduler = lambda *a, **k: types.SimpleNamespace(
 
 app = importlib.import_module("app")
 
+# The admin API was never stubbed here -- it stayed off the network only because
+# ADMIN_API_USER/PASS are unset and every caller returned early on that. The
+# review-claim path added 2026-09-15 called it unconditionally and this suite
+# fired a real POST at production (401, no harm, but a live call from a test
+# that advertises "no network"). Stubbed explicitly now, so the guarantee is
+# enforced rather than incidental.
+ADMIN_CALLS = []
+
+
+def _no_network(name):
+    def _stub(path, *args, **kwargs):
+        ADMIN_CALLS.append((name, path))
+        raise AssertionError(
+            f"isolated test attempted a real admin API {name} to {path}. "
+            "Stub it in the test that needs it."
+        )
+    return _stub
+
+
+app._admin_api_get = _no_network("GET")
+app._admin_api_post = _no_network("POST")
+app._admin_api_patch = _no_network("PATCH")
+
 PASS, FAIL = 0, 0
 
 
@@ -85,15 +108,25 @@ print(f"\nREVIEW_SMS_PAUSED = {app.REVIEW_SMS_PAUSED}  (--unpaused={UNPAUSED})\n
 # ------------------------------------------------------------ 1. send_sms gate
 print("1. send_sms category gate")
 SENT.clear()
-sid, status, err = app.send_sms(CUSTOMER, "review please", category="review")
+# Every review send now needs the repair it belongs to (2026-09-15 duplicate
+# protection), and the claim fails closed when the ledger is unreachable. Both
+# are asserted properly in test_review_once.py; here the claim is stubbed to
+# "won" so this suite keeps testing what it is about -- the PAUSE.
+_granted = {"claim": (True, None), "resolved": []}
+app._claim_review_send = lambda key, phone, **kw: _granted["claim"]
+app._resolve_review_claim = lambda key, status, **kw: _granted["resolved"].append((key, status))
+
+sid, status, err = app.send_sms(CUSTOMER, "review please", category="review", dedupe_key="appt-test-1")
 if app.REVIEW_SMS_PAUSED:
     check("review to customer is refused", err is not None and sid is None, f"got {sid=} {err=}")
     check("nothing left the process", SENT == [], f"got {SENT}")
     check("error names the pause", "REVIEW_SMS_PAUSED" in (err or ""), f"got {err!r}")
+    check("paused send claims nothing", _granted["resolved"] == [], f"got {_granted['resolved']}")
 else:
     check("review to customer is allowed", err is None and sid == "SMtest", f"got {sid=} {err=}")
     check("one message sent", len(SENT) == 1, f"got {SENT}")
     check("opt-out line appended", app.SMS_OPT_OUT_LINE in SENT[0]["body"], f"got {SENT[0]['body']!r}")
+    check("claim resolved as sent", _granted["resolved"] == [("appt-test-1", "sent")], f"got {_granted['resolved']}")
 
 SENT.clear()
 _, _, err = app.send_sms(CUSTOMER, "hi", category="transactional")
@@ -122,7 +155,9 @@ sid, _, err = app.send_sms(OWNER, "owner test", category="review", owner_test_ov
 check("override works for OWNER_PHONE", err is None and sid == "SMtest", f"got {sid=} {err=}")
 
 SENT.clear()
-sid, _, err = app.send_sms(CUSTOMER, "sneaky", category="review", owner_test_override=True)
+# With a valid key, so this tests the OVERRIDE scoping rather than tripping
+# the missing-key guard first.
+sid, _, err = app.send_sms(CUSTOMER, "sneaky", category="review", dedupe_key="appt-sneaky", owner_test_override=True)
 if app.REVIEW_SMS_PAUSED:
     check("override does NOT work for a customer", sid is None and err is not None, f"got {sid=} {err=}")
     check("nothing sent to the customer", SENT == [], f"got {SENT}")
@@ -167,8 +202,16 @@ else:
 # ------------------------------------------------- 5. website follow-up route
 print("\n5. _send_followup_sms (website follow-up cycle route)")
 SENT.clear()
+# `id` is required now: it is the duplicate-protection key, and a booking
+# without one cannot be protected, so _send_followup_sms refuses it outright.
+APPOINTMENT = {
+    "id": "1789073707785",
+    "phone": "3185550142",
+    "repairs": [{"repair": "screen"}],
+    "firstName": "Test",
+}
 ok, err = app._send_followup_sms(
-    {"phone": "3185550142", "repairs": [{"repair": "screen"}], "name": "Test"},
+    APPOINTMENT,
     {"googleReviewUrl": app.REVIEW_LINK, "serviceRecommendationsEnabled": False},
 )
 if app.REVIEW_SMS_PAUSED:
@@ -176,6 +219,15 @@ if app.REVIEW_SMS_PAUSED:
     check("nothing sent", SENT == [], f"got {SENT}")
 else:
     check("follow-up sends when unpaused", ok is True and len(SENT) == 1, f"got {ok=} {err=}")
+
+SENT.clear()
+ok, err = app._send_followup_sms(
+    {k: v for k, v in APPOINTMENT.items() if k != "id"},
+    {"googleReviewUrl": app.REVIEW_LINK},
+)
+check("booking with no id is refused, not sent unprotected",
+      ok is False and "duplicate protection" in (err or ""), f"got {ok=} {err=}")
+check("and nothing left the process", SENT == [], f"got {SENT}")
 
 # ------------------------------------------------------ 6. consent gate shape
 print("\n6. _has_written_consent fails closed")

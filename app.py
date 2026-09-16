@@ -79,7 +79,86 @@ class ReviewSmsPaused(Exception):
     """Raised when a review-category send is attempted while paused."""
 
 
-def send_sms(to, body, *, category, owner_test_override=False):
+def _classify_send_failure(exc):
+    """Did the provider REFUSE this message, or do we simply not know?
+
+    The distinction decides whether a retry is allowed, so it must not be
+    guessed. A TwilioRestException carries an HTTP status: the request reached
+    Twilio and Twilio answered it, so a 4xx is a definite refusal (bad number,
+    blocked recipient) and nothing was sent. Anything else -- a socket timeout,
+    a dropped connection, a 5xx -- happened at or after the moment the message
+    may already have been accepted, and there is no way to tell from here.
+
+    Murad, 2026-09-15: "An uncertain send must be reconciled before any retry."
+    So the ambiguous case returns 'uncertain', which the claim ledger treats as
+    permanently blocking until somebody checks the provider and resolves it.
+    """
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    if isinstance(status, int) and 400 <= status < 500:
+        return "failed"
+    return "uncertain"
+
+
+def _claim_review_send(key, phone, *, claimed_by, source="", customer_name="", completed_at=""):
+    """Win the right to send ONE review text for this repair, or don't send.
+
+    Insert-if-absent under an exclusive lock on the server, so of two senders
+    racing for the same repair exactly one is told claimed=true. Proven with 20
+    concurrent claimers against an isolated store: 1 true, 19 false.
+
+    FAILS CLOSED. If the ledger cannot be reached we cannot prove this is not a
+    duplicate, and a duplicate review request is the exact thing being
+    prevented. Not sending is recoverable; texting someone twice is not.
+
+    Unconfigured credentials fail closed WITHOUT a request. The first version
+    posted anyway and got a 401 from production -- during an isolated test run,
+    which is how it was caught. An agent with no admin credentials cannot read
+    the ledger, therefore cannot prove non-duplication, therefore must not send;
+    firing an unauthenticated POST at the admin API to discover that is both
+    pointless and a live call from a test.
+    """
+    if not (ADMIN_API_USER and ADMIN_API_PASS):
+        print(f"_claim_review_send: admin API not configured, failing closed for {key}")
+        return False, "ledger unavailable (admin API not configured)"
+
+    try:
+        response = _admin_api_post(
+            "/admin-api/review-sends.php",
+            {
+                "key": key,
+                "phone": phone,
+                "claimedBy": claimed_by,
+                "source": source,
+                "customerName": customer_name,
+                "completedAt": completed_at,
+            },
+        )
+    except Exception as exc:
+        print(f"_claim_review_send: ledger unreachable for {key}, failing closed: {exc}")
+        return False, "ledger unreachable"
+
+    if response.get("claimed"):
+        return True, None
+    return False, response.get("reason") or "already claimed"
+
+
+def _resolve_review_claim(key, status, *, sid=None, error=None, by="phone-agent"):
+    """Record what became of a claim. Best-effort by design.
+
+    A failure here cannot un-send a message, and must never raise into the send
+    path. The cost of losing this write is a claim stuck in 'claimed', which
+    blocks -- the safe direction.
+    """
+    try:
+        _admin_api_patch(
+            "/admin-api/review-sends.php",
+            {"key": key, "status": status, "sid": sid, "error": error, "by": by},
+        )
+    except Exception as exc:
+        print(f"_resolve_review_claim({key} -> {status}) failed, claim stays blocking: {exc}")
+
+
+def send_sms(to, body, *, category, dedupe_key=None, owner_test_override=False):
     """The one place an outbound SMS is built and sent.
 
     `category` is not decoration -- it decides three things that were previously
@@ -112,11 +191,50 @@ def send_sms(to, body, *, category, owner_test_override=False):
     if category not in ("review", "marketing", "transactional", "owner"):
         raise ValueError("category must be review, marketing, transactional or owner")
 
+    # Computed once and reused for BOTH the pause bypass and the ledger
+    # exemption below. The flag alone is not trusted anywhere: the destination
+    # must actually be the owner's own number, so a future call site that passes
+    # owner_test_override at a customer gets neither privilege.
+    is_owner_test = bool(owner_test_override) and _normalize_phone(to) == _normalize_phone(OWNER_PHONE)
+
     if category == "review" and REVIEW_SMS_PAUSED:
-        if not (owner_test_override and _normalize_phone(to) == _normalize_phone(OWNER_PHONE)):
+        if not is_owner_test:
             print(f"send_sms: REFUSED review send to ...{str(to)[-4:]} -- REVIEW_SMS_PAUSED is on")
             return None, None, "review SMS is paused (REVIEW_SMS_PAUSED)"
         print("send_sms: review pause released for the authorized owner test")
+
+    # ---------------------------------------------------- one text per repair
+    # Murad, 2026-09-15: "Implement one review request per completed repair,
+    # with duplicate protection across every sending path."
+    #
+    # EVERY path is the operative phrase. There are three today (the website
+    # follow-up cycle, /send-pos-review, and the phone agent's own tool) and the
+    # history of this file is that a fourth gets added and forgets a gate. So
+    # the key is REQUIRED here rather than checked politely at each call site:
+    # a new caller that omits it raises on its first run instead of quietly
+    # becoming the path with no duplicate protection.
+    claim_key = None
+    if category == "review" and is_owner_test:
+        # The owner test is exempt, and must be. The ledger protects customers
+        # from a second text; Murad testing his own phone is not a customer, and
+        # a test row in a production ledger is exactly the kind of artefact that
+        # later gets mistaken for a real send. Exempt on the VERIFIED condition
+        # above, never on the caller's say-so.
+        print("send_sms: owner test -- no review claim written")
+    elif category == "review":
+        if not dedupe_key:
+            raise ValueError(
+                "category='review' requires dedupe_key -- the repair this text is for "
+                "(appt-<id>, pos-<id>, pos-inv-<id>). Without it there is no duplicate "
+                "protection and the send is refused."
+            )
+        claim_key = str(dedupe_key)
+        won, why = _claim_review_send(
+            claim_key, to, claimed_by="send_sms", source=category
+        )
+        if not won:
+            print(f"send_sms: REFUSED review send for {claim_key} -- {why}")
+            return None, None, f"duplicate review send blocked ({why})"
 
     text = body
     if category in ("review", "marketing") and SMS_OPT_OUT_LINE not in text:
@@ -124,9 +242,16 @@ def send_sms(to, body, *, category, owner_test_override=False):
 
     try:
         msg = twilio_client.messages.create(to=to, body=text[:1500], **_sender_kwargs())
-        return msg.sid, msg.status, None
     except Exception as exc:
+        if claim_key:
+            # 'failed' releases the claim for a later retry; 'uncertain' does
+            # not, and deliberately: see _classify_send_failure.
+            _resolve_review_claim(claim_key, _classify_send_failure(exc), error=str(exc))
         return None, None, str(exc)
+
+    if claim_key:
+        _resolve_review_claim(claim_key, "sent", sid=msg.sid)
+    return msg.sid, msg.status, None
 
 MODEL = "claude-haiku-4-5-20251001"
 
@@ -943,11 +1068,26 @@ def send_review_link_sms(caller_number):
     if _is_opted_out(caller_number):
         print(f"send_review_link_sms: skipped, number opted out ({caller_number[-4:]})")
         return
+    # A caller who ASKS for the link on the phone is initiating it themselves,
+    # which is a different thing from the automated post-repair text. But it is
+    # still a review link arriving from the same number, and Murad's rule is one
+    # review request per completed repair -- so if this number was already sent
+    # the automated one recently, this stays quiet rather than making it two.
+    if _recently_sent_review(caller_number):
+        print(f"send_review_link_sms: skipped, ...{caller_number[-4:]} already got a review text recently")
+        return
+
     body = f"Thanks for calling Twin Wireless! Mind leaving us a quick review? {REVIEW_LINK}"
     # Routed through send_sms so it uses the approved Messaging Service, carries
     # the opt-out disclosure, and passes the server-side review pause. It had
     # been calling twilio_client directly, bypassing all three.
-    sid, _status, err = send_sms(caller_number, body, category="review")
+    #
+    # Its own key space: one per number per day, so a caller who asks twice in
+    # one call gets one text, while a genuine ask months later is not blocked by
+    # a year-old claim.
+    day = datetime.datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
+    key = f"call-{re.sub(r'[^0-9]', '', caller_number)}-{day}"
+    sid, _status, err = send_sms(caller_number, body, category="review", dedupe_key=key)
     if err:
         print(f"send_review_link_sms failed: {err}")
 
@@ -1115,6 +1255,48 @@ def _is_opted_out(phone):
         return True
 
 
+REVIEW_QUIET_DAYS = 45
+
+
+def _recently_sent_review(phone):
+    """Has this number had ANY review text from us inside the quiet window?
+
+    Guards the cross-path case the per-repair key cannot: the same person,
+    two different repair ids. The per-repair claim is what stops a repair being
+    texted twice; this is what stops a customer being asked three times in a
+    fortnight because they brought in three devices.
+
+    FAILS CLOSED on a ledger error, same reasoning as the claim itself.
+    """
+    normalized = _normalize_phone(phone) or phone
+    if not (ADMIN_API_USER and ADMIN_API_PASS) or not normalized:
+        return False
+    try:
+        data = _admin_api_get("/admin-api/review-sends.php", params={"phone": normalized})
+    except Exception as exc:
+        print(f"_recently_sent_review: ledger unreachable for {normalized}, failing closed: {exc}")
+        return True
+
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=REVIEW_QUIET_DAYS)
+    for record in (data.get("records") or {}).values():
+        if record.get("status") != "sent":
+            continue
+        stamp = record.get("sentAt") or record.get("claimedAt")
+        if not stamp:
+            # Sent, but we don't know when. Treat as recent -- an unknown date
+            # is not evidence that enough time has passed.
+            return True
+        try:
+            sent_at = datetime.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=datetime.timezone.utc)
+        if sent_at > cutoff:
+            return True
+    return False
+
+
 def _has_written_consent(phone):
     """Prior express WRITTEN consent gate for review/marketing sends.
 
@@ -1236,44 +1418,52 @@ def _service_recommendation(appointment):
     return f"Also, if it's ever useful, we also do {candidates[0]} -- just ask next time you're in."
 
 
-def _build_followup_message(appointment, settings):
-    first_name = (appointment.get("firstName") or "").strip() or "there"
+def build_review_message(first_name, settings=None):
+    """The one review text, exactly as Murad wrote it on 2026-09-15.
+
+    His words: "My goal is one useful review request after service -- not a
+    marketing sequence." Three things were removed to get here, and each of
+    them is why the old message needed promotional consent this one does not:
+
+      * the social-follow line (three handles) -- pure promotion
+      * the service recommendation pulled from the catalog -- an upsell
+      * the "tell us honestly, good or bad" feedback ask -- harmless in
+        itself, but it invites a reply, and a reply thread is what turns one
+        message into a conversation nobody consented to
+
+    What is left names the shop, thanks the customer, offers the link, and
+    says how to stop. Nothing is templated in but the first name, so there is
+    no device string to get wrong and no price or rating to go stale.
+
+    Kept deliberately free of {device}: the POS product field is free text
+    ("Samsung S9 Plus", sometimes with an IMEI stuck to it) and a mangled
+    device name in a customer's text reads worse than no device name at all.
+    """
+    settings = settings or {}
+    name = (first_name or "").strip() or "there"
     review_url = settings.get("googleReviewUrl") or REVIEW_LINK
+    return (
+        f"Hi {name}, thank you for choosing Twin Wireless. "
+        f"If you'd like to share your experience, here's our Google review link: "
+        f"{review_url} {SMS_OPT_OUT_LINE}"
+    )
 
-    # Expanded copy per Murad 2026-09-11: besides the review ask, every
-    # follow-up now (a) invites honest experience/improvement feedback --
-    # replies land in the admin panel via the /sms customerResponse capture --
-    # and (b) asks for a social follow. The generic website plug was dropped
-    # to keep the text at a reasonable length.
-    parts = [
-        f"Hi {first_name}! This is Twin Wireless. Just checking in on your repair -- "
-        "how's everything holding up? Reply and tell us honestly, good or bad. Your "
-        "feedback helps us improve our service and our team.",
-        "If we earned it, a quick Google review means a lot to our local shop: "
-        f"{review_url}",
-    ]
 
-    if settings.get("serviceRecommendationsEnabled", True):
-        recommendation = _service_recommendation(appointment)
-        if recommendation:
-            parts.append(recommendation)
+def _build_followup_message(appointment, settings):
+    """Website-booking wrapper. Every sender now composes the SAME text.
 
-    parts.append(SOCIAL_LINE)
+    It used to assemble its own parts list, and /send-pos-review assembled a
+    different one, which is how the two paths drifted into sending materially
+    different messages for the same purpose. There is one builder now; this
+    exists only to pull the first name off an appointment record.
 
-    # Opt-out disclosure. Added 2026-09-14 after a compliance review found that
-    # inbound STOP was handled correctly but NO outbound message ever told the
-    # customer they could send it -- a grep for "reply stop" across this file
-    # returned nothing. That gap matters more here than on a purely
-    # transactional text: this message asks for a Google review AND a social
-    # follow, which is marketing, and a marketing SMS that never discloses how
-    # to opt out is the clearest compliance failure in the pipeline.
-    #
-    # APPENDED AFTER THE TRIM, deliberately. The body is capped at 1400 chars
-    # and [:1400] cuts from the END, so a long recommendation could otherwise
-    # eat exactly the line that must never go missing. Budget the cap for the
-    # body and add the disclosure afterwards.
-    body = " ".join(parts)[:1400 - len(SMS_OPT_OUT_LINE) - 1]
-    return f"{body} {SMS_OPT_OUT_LINE}"
+    No truncation guard any more, and none needed: the message is a fixed
+    ~150 characters with only a first name interpolated, so the old
+    "trim to 1400 then re-append the opt-out line" dance -- which existed
+    because a long catalog recommendation could push the disclosure off the
+    end -- has nothing left to protect against.
+    """
+    return build_review_message((appointment.get("firstName") or "").strip(), settings)
 
 
 def _normalize_phone(phone):
@@ -1289,16 +1479,76 @@ def _normalize_phone(phone):
     return None
 
 
+def _is_backlog(completed_at, settings, now=None):
+    """True if this repair finished too long ago to text about now.
+
+    Two ways to be too old, and the explicit one wins:
+
+      reviewBacklogCutoff  an ISO date. Nothing completed before it is ever
+                           texted. This is what gets set on the day the
+                           workflow is switched back on, so the switch-on
+                           cannot sweep up the pause period.
+      reviewMaxAgeDays     the standing rule once the cutoff is long past
+                           (default 14). A repair that sat unsent for a
+                           fortnight has missed its moment; texting it now is
+                           worse than not texting it.
+
+    Unparseable or missing completion date returns True -- not knowing when a
+    repair finished is not a reason to assume it finished recently.
+    """
+    if not completed_at:
+        return True
+    try:
+        completed = datetime.datetime.fromisoformat(str(completed_at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=datetime.timezone.utc)
+
+    cutoff_setting = (settings or {}).get("reviewBacklogCutoff")
+    if cutoff_setting:
+        try:
+            cutoff = datetime.datetime.fromisoformat(str(cutoff_setting).replace("Z", "+00:00"))
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=datetime.timezone.utc)
+            if completed < cutoff:
+                return True
+        except ValueError:
+            print(f"_is_backlog: unparseable reviewBacklogCutoff {cutoff_setting!r}, ignoring it")
+
+    max_age = int((settings or {}).get("reviewMaxAgeDays", 14) or 14)
+    reference = now or datetime.datetime.now(datetime.timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=datetime.timezone.utc)
+    return completed < reference - datetime.timedelta(days=max_age)
+
+
+def review_dedupe_key(record_id):
+    """The repair a review text belongs to, as a stable ledger key.
+
+    Website bookings are bare numeric ids; POS records already arrive carrying
+    their own `pos-` / `pos-inv-` prefix. Prefixing the bare ones keeps the two
+    id spaces from ever colliding on a number that happens to match.
+    """
+    raw = str(record_id or "").strip()
+    if not raw:
+        return None
+    return raw if raw.startswith("pos-") else f"appt-{raw}"
+
+
 def _send_followup_sms(appointment, settings):
     phone = _normalize_phone(appointment.get("phone", ""))
     if not phone:
         return False, f"appointment has no usable phone number: {appointment.get('phone')!r}"
+    key = review_dedupe_key(appointment.get("id"))
+    if not key:
+        return False, "appointment has no id -- cannot key duplicate protection, refusing to send"
     body = _build_followup_message(appointment, settings)
     # Was calling twilio_client directly with from_=TWILIO_FROM_NUMBER, which
     # bypassed the approved Messaging Service, the opt-out disclosure, and (once
     # it existed) the review pause. This message asks for a Google review, so it
     # is category="review" and is refused server-side while paused.
-    sid, _status, err = send_sms(phone, body, category="review")
+    sid, _status, err = send_sms(phone, body, category="review", dedupe_key=key)
     if err:
         return False, err
     return True, None
@@ -1432,6 +1682,28 @@ def run_followup_cycle():
             )
             continue
 
+        # No historical backlog. Murad, 2026-09-15: "Do not release a historical
+        # backlog." Switching this workflow on must not fire off texts about
+        # repairs finished weeks ago -- to that customer the message arrives out
+        # of nowhere, long after anything they'd remember.
+        #
+        # The claim ledger already blocks everyone previously texted, but it
+        # cannot speak for a repair that completed during the pause and was
+        # never texted at all. This is the gate for those.
+        if _is_backlog(record.get("fulfilledAt"), settings, now):
+            print(
+                "Follow-up cycle: skipping appointment "
+                f"{record.get('appointmentId')} -- completed before the backlog cutoff"
+            )
+            continue
+
+        if _recently_sent_review(record_phone):
+            print(
+                "Follow-up cycle: skipping appointment "
+                f"{record.get('appointmentId')} -- this number had a review text recently"
+            )
+            continue
+
         sent_ok, error = _send_followup_sms(appointment, settings)
         appointment_id = record["appointmentId"]
         if sent_ok:
@@ -1453,6 +1725,15 @@ def run_followup_cycle():
             if attempts >= max_retries:
                 patch["followUpStatus"] = "failed"
                 patch["staffFollowupRequired"] = True
+            # An uncertain send is not a failure to retry, it is a question to
+            # answer: did that message actually leave? The claim ledger already
+            # refuses further attempts. This surfaces it in the admin panel so
+            # somebody checks the Twilio log and resolves it, instead of it
+            # sitting quietly as a retry that will never succeed.
+            if "duplicate review send blocked" in str(error):
+                patch["followUpStatus"] = "blocked-duplicate"
+                patch["staffFollowupRequired"] = False
+                patch["attempts"] = record.get("attempts", 0)  # not a real attempt
             try:
                 _admin_api_patch("/admin-api/followups.php", patch)
             except Exception as exc:
@@ -1888,15 +2169,11 @@ def send_review_test():
     if not accepted or given not in accepted:
         return {"error": "unauthorized"}, 401
 
-    # The REVIEW-ONLY wording submitted to Twilio on ticket #29564371, not the
-    # old promotional body. Murad, 2026-09-15: "Do not include social-follow
-    # promotions in the proposed review-only message." A test of a workflow we
-    # have not proposed would prove nothing about the workflow we have.
-    body = (
-        "Hi Murad, this is Twin Wireless on Line Ave. Your test device repair is "
-        "done -- how's it holding up? Reply and tell us honestly, good or bad. "
-        f"If you'd rather leave it as a Google review: {REVIEW_LINK}"
-    )
+    # The REAL message, from the one builder every customer send uses. Not a
+    # copy of it -- a copy is how the test ends up proving wording that is no
+    # longer what ships. If build_review_message changes, this test changes with
+    # it automatically, which is the only way the test means anything.
+    body = build_review_message("Murad")
 
     # category="review" so this exercises the real gated path. The override is
     # the ONLY way past the pause, and send_sms honours it solely because the
@@ -1973,6 +2250,17 @@ def send_pos_review():
     if not _has_written_consent(phone):
         return {"ok": False, "skipped": "no-written-consent"}
 
+    # Same two guards the website cycle applies, for the same reasons: no
+    # historical backlog when the workflow is switched on, and no third review
+    # ask to one person inside the quiet window because they brought in three
+    # devices. Applied HERE and not left to send-reviews.py, because this
+    # endpoint is reachable without it.
+    if _is_backlog((data.get("completedAt") or "").strip(), get_followup_settings()):
+        return {"ok": False, "skipped": "backlog-cutoff"}
+
+    if _recently_sent_review(phone):
+        return {"ok": False, "skipped": "recent-review-text"}
+
     # Dedupe against the website follow-up ledger. Fail-open on a read error:
     # the caller's ledger already prevents re-sends of ITS records, and
     # blocking every POS review because the website API hiccuped is the worse
@@ -1987,35 +2275,36 @@ def send_pos_review():
     except Exception as exc:
         print(f"send_pos_review: followups dedupe unavailable, proceeding: {exc}")
 
-    # Purchases (invoice customers, repairId "inv-...") get purchase wording;
-    # everything else is a repair. Both now carry the experience/improvement
-    # ask and the social-follow line (Murad, 2026-09-11).
-    is_purchase = str(data.get("repairId") or "").startswith("inv-")
-    what = f"your {device}" if device else "your device"
-    if is_purchase:
-        opener = (
-            f"Hi {first_name}! This is Twin Wireless. Just checking in -- how's "
-            f"{what} treating you? Reply and tell us honestly, good or bad. Your "
-            "feedback helps us improve our service and our team."
-        )
-    else:
-        opener = (
-            f"Hi {first_name}! This is Twin Wireless. Just checking in -- how's "
-            f"{what} holding up since the repair? Reply and tell us honestly, good "
-            "or bad. Your feedback helps us improve our service and our team."
-        )
-    body = (
-        f"{opener} If we earned it, a quick Google review means a lot to our "
-        f"local shop: {REVIEW_LINK} {SOCIAL_LINE}"
+    # One builder, one message. This endpoint used to compose its own wording
+    # -- two variants, repair and purchase, both carrying the social-follow line
+    # -- while the website cycle composed a third. Same purpose, three texts,
+    # and only one of them ever got reviewed when the wording changed.
+    #
+    # The repair/purchase split went with it. It only existed to phrase a device
+    # name ("how's your Samsung S9 Plus holding up"), and the neutral message
+    # names no device, so there is nothing left for the two variants to differ
+    # about.
+    body = build_review_message(first_name)
+
+    # Duplicate protection, keyed on the POS record. send-reviews.py keeps its
+    # own ledger on the shop machine and that one still runs -- this is the
+    # server-side half, and it is the half that also sees what the website cycle
+    # did. Neither ledger alone covers a customer who booked online and also has
+    # a POS record.
+    key = review_dedupe_key(f"pos-{str(data.get('repairId') or '').strip()}")
+    if not key or key == "pos-":
+        return {"ok": False, "skipped": "no-repair-id"}, 400
+
+    sid, provider_status, err = send_sms(
+        phone, body, category="review", dedupe_key=key
     )
-    # This is the marketing path: a review ask plus three social handles. It had
-    # NO opt-out disclosure -- SMS_OPT_OUT_LINE existed but was only used on the
-    # website follow-up. send_sms appends it for category="marketing" so a new
-    # call site cannot forget it, and routes through the approved Messaging
-    # Service when one is configured.
-    sid, provider_status, err = send_sms(phone, body, category="review")
     if err:
         print(f"send_pos_review failed for ...{phone[-4:]}: {err}")
+        # A blocked duplicate is not a server error -- it is the guard doing its
+        # job, and the caller should see it as a skip so a nightly run does not
+        # report a failure every time it re-offers a customer already texted.
+        if "duplicate review send blocked" in err:
+            return {"ok": False, "skipped": "already-sent", "detail": err}
         return {"ok": False, "error": err}, 502
 
     class _Msg:
